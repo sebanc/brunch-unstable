@@ -1,4 +1,4 @@
-CONFIG_LOCALVERSION="-brunch-sebanc"
+CONFIG_LOCALVERSION="-brunch-exp-tejasraman"
 CONFIG_FB=y
 CONFIG_FB_EFI=y
 CONFIG_FB_VESA=y
