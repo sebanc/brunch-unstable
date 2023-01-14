@@ -1,4 +1,4 @@
-CONFIG_LOCALVERSION="-macbook-brunch-exp-tejasraman"
+CONFIG_LOCALVERSION="-macbook-brunch-sebanc"
 CONFIG_FB=y
 CONFIG_FB_EFI=y
 CONFIG_FB_VESA=y
