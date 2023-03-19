@@ -7,7 +7,7 @@ busybox mount -t devtmpfs none /dev
 busybox --install -s
 ln -s /proc/mounts /etc/mtab
 
-if ! grep -q 'sse4_2' /proc/cpuinfo; then
+if ! grep -q 'avx2' /proc/cpuinfo; then
 	echo 0 0 0 0 > /proc/sys/kernel/printk
 	echo "brunch: This CPU is not compatible with Brunch, please refer to the Brunch github for more information." > /dev/kmsg
 	if [ ! -z "$brunch_bootsplash" ] && [ -f /bootsplashes/"$brunch_bootsplash"/incompatible.png ]; then fbv -f /bootsplashes/"$brunch_bootsplash"/incompatible.png & fi
