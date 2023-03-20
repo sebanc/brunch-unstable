@@ -84,14 +84,20 @@ tar zcvf ../rootc/packages/binaries.tar.gz * --owner=0 --group=0 || { echo "Fail
 cd .. || { echo "Failed to make binaries package archive"; exit 1; }
 rm -rf ./binaries-pkg || { echo "Failed to make binaries package archive"; exit 1; }
 
-git clone --depth=1 -b master https://github.com/godspeed1989/fbv.git fbv || { echo "Failed to make fbv"; exit 1; }
-cd ./fbv || { echo "Failed to make fbv"; exit 1; }
-./configure --prefix=/ || { echo "Failed to make fbv"; exit 1; }
-make -j"$NTHREADS" || { echo "Failed to make fbv"; exit 1; }
-cp ./fbv ../initramfs/bin/ || { echo "Failed to make fbv"; exit 1; }
-for i in $(ldd ./fbv | cut -d' ' -f3); do cp "$i" ../initramfs/lib64/ || { echo "Failed to make fbv"; exit 1; }; done
-cd .. || { echo "Failed to make fbv"; exit 1; }
-rm -rf ./fbv || { echo "Failed to make fbv"; exit 1; }
+# git clone --depth=1 -b master https://github.com/godspeed1989/fbv.git fbv || { echo "Failed to make fbv"; exit 1; }
+# cd ./fbv || { echo "Failed to make fbv"; exit 1; }
+# ./configure --prefix=/ || { echo "Failed to make fbv"; exit 1; }
+# make -j"$NTHREADS" || { echo "Failed to make fbv"; exit 1; }
+# cp ./fbv ../initramfs/bin/ || { echo "Failed to make fbv"; exit 1; }
+# for i in $(ldd ./fbv | cut -d' ' -f3); do cp "$i" ../initramfs/lib64/ || { echo "Failed to make fbv"; exit 1; }; done
+# cd .. || { echo "Failed to make fbv"; exit 1; }
+# rm -rf ./fbv || { echo "Failed to make fbv"; exit 1; }
+
+git clone https://github.com/tejasraman/jfbview-prebuild-brunch jfbview
+cd ./jfbview
+cp jfbview ../initramfs/bin
+cd ..
+rm -r ./jfbview
 
 git clone https://github.com/linux-surface/iptsd.git iptsd || { echo "Failed to make iptsd"; exit 1; }
 cd iptsd || { echo "Failed to make iptsd"; exit 1; }
