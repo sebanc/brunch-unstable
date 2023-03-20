@@ -7,15 +7,17 @@ busybox mount -t devtmpfs none /dev
 busybox --install -s
 ln -s /proc/mounts /etc/mtab
 
+echo "brunch: This is an experimental build. Please do not use this in a production environment."
+
 if ! grep -q 'avx2' /proc/cpuinfo; then
 	echo 0 0 0 0 > /proc/sys/kernel/printk
 	echo "brunch: This CPU is not compatible with Brunch, please refer to the Brunch github for more information." > /dev/kmsg
-	if [ ! -z "$brunch_bootsplash" ] && [ -f /bootsplashes/"$brunch_bootsplash"/incompatible.png ]; then fbv -f /bootsplashes/"$brunch_bootsplash"/incompatible.png & fi
-	sleep 10
+	if [ ! -z "$brunch_bootsplash" ] && [ -f /bootsplashes/"$brunch_bootsplash"/incompatible.png ]; then jfbview --zoom_to_width /bootsplashes/"$brunch_bootsplash"/incompatible.pdf & fi
+	sleep 12
 	reboot -f
 fi
 
-if [ ! -z "$brunch_bootsplash" ] && [ -f /bootsplashes/"$brunch_bootsplash"/main.png ]; then fbv -f /bootsplashes/"$brunch_bootsplash"/main.png & fi
+if [ ! -z "$brunch_bootsplash" ] && [ -f /bootsplashes/"$brunch_bootsplash"/main.png ]; then jfbview --zoom_to_width /bootsplashes/"$brunch_bootsplash"/main.pdf & fi
 
 haveged -w 1024 -v 1 -F > /dev/kmsg 2>&1 &
 
@@ -160,10 +162,10 @@ if [ "$rebuild" -eq 1 ]; then
 fi
 
 if [ "$rebuild" -eq 1 ] && [ "$rootb_is_valid" -eq 1 ]; then
-	if [ ! -z "$brunch_bootsplash" ] && [ -f /bootsplashes/"$brunch_bootsplash"/rebuilding.png ]; then fbv -f /bootsplashes/"$brunch_bootsplash"/rebuilding.png & fi
+	if [ ! -z "$brunch_bootsplash" ] && [ -f /bootsplashes/"$brunch_bootsplash"/rebuilding.png ]; then jfbview --zoom-to-width /bootsplashes/"$brunch_bootsplash"/rootfs.pdf & fi
 	echo "brunch: rebuilding ChromeOS rootfs, it might take a few minutes..." > /dev/kmsg
 	pv "$partpath"5 > "$partpath"3
-	if [ ! -z "$brunch_bootsplash" ] && [ -f /bootsplashes/"$brunch_bootsplash"/patching.png ]; then fbv -f /bootsplashes/"$brunch_bootsplash"/patching.png & fi
+	if [ ! -z "$brunch_bootsplash" ] && [ -f /bootsplashes/"$brunch_bootsplash"/patching.png ]; then jfbview --zoom-to-width /bootsplashes/"$brunch_bootsplash"/patching.pdf & fi
 	printf '\000' | dd of="$partpath"3 seek=$((0x464 + 3)) conv=notrunc count=1 bs=1 status=none
 	mount "$partpath"3 /roota
 	resize2fs -f "$partpath"3
