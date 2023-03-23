@@ -11,7 +11,7 @@ concurrency:
 jobs:
   prepare-kernels:
     name: Prepare Kernels
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.kernels.outputs.matrix }}
     steps:
