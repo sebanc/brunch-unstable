@@ -11,7 +11,7 @@ concurrency:
 jobs:
   prepare-kernels:
     name: Prepare Kernels
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-20.04
     outputs:
       matrix: ${{ steps.kernels.outputs.matrix }}
     steps:
@@ -146,10 +146,10 @@ jobs:
           RELEASE_VERSION=$(echo "$RELEASE_FILE" | cut -d'.' -f1 | cut -d'_' -f2)
           RELEASE_DATE=$(echo "$RELEASE_FILE" | cut -d'.' -f1 | cut -d'_' -f3)
           echo "Found brunch release: ${RELEASE_FILE} with version ${RELEASE_VERSION} and date ${RELEASE_DATE}"
-          mv "brunch_${RELEASE_VERSION}_${RELEASE_DATE}.tar.gz" "brunch_${RELEASE_VERSION}_${RELEASE_VERSION_TYPE}_${RELEASE_DATE}.tar.gz"
-          echo "Brunch release renamed from brunch_${RELEASE_VERSION}_${RELEASE_DATE}.tar.gz to brunch_${RELEASE_VERSION}_${RELEASE_VERSION_TYPE}_${RELEASE_DATE}.tar.gz"
-          echo "RELEASE_FILE=brunch_${RELEASE_VERSION}_${RELEASE_VERSION_TYPE}_${RELEASE_DATE}.tar.gz" >> $GITHUB_ENV
-          echo "RELEASE_TAG=${RELEASE_VERSION}-${RELEASE_VERSION_TYPE}-${RELEASE_DATE}" >> $GITHUB_ENV
+          mv "brunch_${RELEASE_VERSION}_${RELEASE_DATE}.tar.gz" "brunch_${RELEASE_VERSION}_${RELEASE_VERSION_TYPE}_${RELEASE_DATE}-bootsplash-exp.tar.gz"
+          echo "Brunch release renamed from brunch_${RELEASE_VERSION}_${RELEASE_DATE}.tar.gz to brunch_${RELEASE_VERSION}_${RELEASE_VERSION_TYPE}_${RELEASE_DATE}-bootsplash-exp.tar.gz"
+          echo "RELEASE_FILE=brunch_${RELEASE_VERSION}_${RELEASE_VERSION_TYPE}_${RELEASE_DATE}-bootsplash-exp.tar.gz" >> $GITHUB_ENV
+          echo "RELEASE_TAG=${RELEASE_VERSION}-${RELEASE_VERSION_TYPE}-${RELEASE_DATE}-bootsplash-exp" >> $GITHUB_ENV
           echo "RELEASE_NAME=Brunch ${RELEASE_VERSION} ${RELEASE_VERSION_TYPE} ${RELEASE_DATE}" >> $GITHUB_ENV          
       - name: Create a release and upload artifacts as assets
         uses: ncipollo/release-action@v1
