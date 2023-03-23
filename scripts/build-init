@@ -2,10 +2,10 @@
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export HOME=/home/chronos
 export LD_LIBRARY_PATH=/home/chronos/ncurses-pkg/usr/lib64:/usr/local/lib64:/usr/local/lib:/usr/lib64:/usr/lib:/lib64:/lib
-export C_INCLUDE_PATH=/usr/local/include/ncurses:/usr/local/include:/usr/include
+export C_INCLUDE_PATH=/home/chronos/ncurses-pkg/usr/include:/usr/local/include:/usr/include
 export GCONV_PATH=/usr/local/lib64/gconv
 export PERL5LIB=/usr/local/lib/perl5/5.32.0
-export PKG_CONFIG_PATH=/home/chronos/inih-pkg/usr/lib64/pkgconfig:/home/chronos/ncurses-pkg/usr/lib64/pkgconfig:/home/chronos/efibootmgr-pkg/usr/lib64/pkgconfig:/usr/local/lib64/pkgconfig:/usr/local/share/pkgconfig
+export PKG_CONFIG_PATH=/home/chronos/ncurses-pkg/usr/lib64/pkgconfig:/home/chronos/efibootmgr-pkg/usr/lib64/pkgconfig:/usr/local/lib64/pkgconfig:/usr/local/share/pkgconfig
 export PYTHON=/usr/local/bin/python3
 export PYTHONHOME=/usr/local
 export SGML_CATALOG_FILES="/usr/local/etc/sgml/catalog"
@@ -84,14 +84,20 @@ tar zcvf ../rootc/packages/binaries.tar.gz * --owner=0 --group=0 || { echo "Fail
 cd .. || { echo "Failed to make binaries package archive"; exit 1; }
 rm -rf ./binaries-pkg || { echo "Failed to make binaries package archive"; exit 1; }
 
-git clone --depth=1 -b master https://github.com/godspeed1989/fbv.git fbv || { echo "Failed to make fbv"; exit 1; }
-cd ./fbv || { echo "Failed to make fbv"; exit 1; }
-./configure --prefix=/ || { echo "Failed to make fbv"; exit 1; }
-make -j"$NTHREADS" || { echo "Failed to make fbv"; exit 1; }
-cp ./fbv ../initramfs/bin/ || { echo "Failed to make fbv"; exit 1; }
-for i in $(ldd ./fbv | cut -d' ' -f3); do cp "$i" ../initramfs/lib64/ || { echo "Failed to make fbv"; exit 1; }; done
-cd .. || { echo "Failed to make fbv"; exit 1; }
-rm -rf ./fbv || { echo "Failed to make fbv"; exit 1; }
+# git clone --depth=1 -b master https://github.com/godspeed1989/fbv.git fbv || { echo "Failed to make fbv"; exit 1; }
+# cd ./fbv || { echo "Failed to make fbv"; exit 1; }
+# ./configure --prefix=/ || { echo "Failed to make fbv"; exit 1; }
+# make -j"$NTHREADS" || { echo "Failed to make fbv"; exit 1; }
+# cp ./fbv ../initramfs/bin/ || { echo "Failed to make fbv"; exit 1; }
+# for i in $(ldd ./fbv | cut -d' ' -f3); do cp "$i" ../initramfs/lib64/ || { echo "Failed to make fbv"; exit 1; }; done
+# cd .. || { echo "Failed to make fbv"; exit 1; }
+# rm -rf ./fbv || { echo "Failed to make fbv"; exit 1; }
+
+git clone https://github.com/tejasraman/jfbview-prebuild-brunch jfbview
+cd ./jfbview
+cp jfbview ../initramfs/bin
+cd ..
+rm -r ./jfbview
 
 git clone https://github.com/linux-surface/iptsd.git iptsd || { echo "Failed to make iptsd"; exit 1; }
 cd iptsd || { echo "Failed to make iptsd"; exit 1; }
@@ -206,15 +212,28 @@ tar zcvf ../rootc/packages/swtpm.tar.gz * --owner=0 --group=0 || { echo "Failed 
 cd .. || { echo "Failed to make swtpm package"; exit 1; }
 rm -rf ./swtpm-pkg || { echo "Failed to make swtpm package"; exit 1; }
 
-git clone --depth=1 -b v9.0.1024 https://github.com/vim/vim.git || { echo "Failed to make vim"; exit 1; }
-cd ./vim || { echo "Failed to make vim"; exit 1; }
-./configure  --prefix=/usr --libdir=/usr/lib64 || { echo "Failed to make vim"; exit 1; }
-make -j"$NTHREADS" || { echo "Failed to make vim"; exit 1; }
-make DESTDIR=/home/chronos/vim-pkg install || { echo "Failed to make vim"; exit 1; }
-cd ../vim-pkg || { echo "Failed to make vim"; exit 1; }
-tar zcvf ../rootc/packages/vim.tar.gz * --owner=0 --group=0 || { echo "Failed to make vim"; exit 1; }
-cd .. || { echo "Failed to make vim"; exit 1; }
-rm -rf ./vim || { echo "Failed to make vim"; exit 1; }
+git clone --depth=1 -b master https://github.com/mirror/ncurses.git || { echo "Failed to make ncurses"; exit 1; }
+cd ./ncurses || { echo "Failed to make ncurses"; exit 1; }
+./configure  --prefix=/usr --libdir=/usr/lib64 --with-shared --without-debug --without-normal --enable-pc-files --with-pkg-config-libdir=/usr/lib64/pkgconfig --enable-widec || { echo "Failed to make ncurses"; exit 1; }
+make -j"$NTHREADS" || { echo "Failed to make ncurses"; exit 1; }
+make DESTDIR=/home/chronos/ncurses-pkg install || { echo "Failed to make ncurses"; exit 1; }
+sed -i 's@/usr@/home/chronos/ncurses-pkg/usr@g' ../ncurses-pkg/usr/lib64/pkgconfig/* || { echo "Failed to make ncurses"; exit 1; }
+cd .. || { echo "Failed to make ncurses"; exit 1; }
+rm -rf ./ncurses || { echo "Failed to make ncurses"; exit 1; }
+
+git clone --depth=1 -b master https://git.savannah.gnu.org/git/nano.git || { echo "Failed to make nano"; exit 1; }
+cd ./nano || { echo "Failed to make nano"; exit 1; }
+./autogen.sh || { echo "Failed to make nano"; exit 1; }
+./configure --prefix=/usr --libdir=/usr/lib64 CFLAGS="-lncurses" || { echo "Failed to make nano"; exit 1; }
+make -j"$NTHREADS" || { echo "Failed to make nano"; exit 1; }
+make DESTDIR=/home/chronos/nano-pkg install || { echo "Failed to make nano"; exit 1; }
+mkdir -p ../nano-pkg/usr/lib64 || { echo "Failed to make nano"; exit 1; }
+for i in $(ldd ../nano-pkg/usr/bin/nano | grep "/usr/local/lib" | grep -v ld-linux | cut -d' ' -f3); do if [ ! -f $(echo "$i" | sed "s#/local##g") ] && [ ! -f $(echo "$i" | sed "s#/usr/local##g") ]; then cp "$i" ../nano-pkg/usr/lib64/ || { echo "Failed to make nano"; exit 1; }; fi; done
+cd ../nano-pkg || { echo "Failed to make nano"; exit 1; }
+cp -r ../ncurses-pkg/usr/share/terminfo ./usr/share/ || { echo "Failed to make nano"; exit 1; }
+tar zcvf ../rootc/packages/nano.tar.gz * --owner=0 --group=0 || { echo "Failed to make nano"; exit 1; }
+cd .. || { echo "Failed to make nano"; exit 1; }
+rm -rf ./ncurses-pkg ./nano ./nano-pkg || { echo "Failed to make nano"; exit 1; }
 
 git clone --depth=1 -b master https://github.com/plougher/squashfs-tools.git || { echo "Failed to make squashfs-tools"; exit 1; }
 cd squashfs-tools/squashfs-tools || { echo "Failed to make squashfs-tools"; exit 1; }
@@ -269,7 +288,10 @@ rm -rf ./busybox || { echo "Failed to finalise initramfs"; exit 1; }
 
 cd ./image
 dd if=/dev/zero of=../brunch/rootc.img bs=1G seek=1 count=0 || { echo "Failed to create rootc image"; exit 1; }
-yes | sudo mkfs.ext4 -F -b 4096 -L "ROOT-C" ../brunch/rootc.img || { echo "Failed to format rootc image"; exit 1; }
+yes | sudo mkfs.ext4 -m 0 -F -b 4096 -L "ROOT-C" ../brunch/rootc.img || { echo "Failed to format rootc image"; exit 1; }
+if sudo tune2fs -l ../brunch/rootc.img | grep 'Filesystem features' | grep -q -w large_dir; then sudo tune2fs -O ^large_dir ../brunch/rootc.img || { echo "Failed to remove large_dir feature"; exit 1; }; fi
+if sudo tune2fs -l ../brunch/rootc.img | grep 'Filesystem features' | grep -q -w metadata_csum_seed; then sudo tune2fs -O ^metadata_csum_seed ../brunch/rootc.img || { echo "Failed to remove metadata_csum_seed feature"; exit 1; }; fi
+if sudo tune2fs -l ../brunch/rootc.img | grep 'Filesystem features' | grep -q -w orphan_file; then sudo tune2fs -O ^orphan_file ../brunch/rootc.img || { echo "Failed to remove orphan_file feature"; exit 1; }; fi
 sudo mount ../brunch/rootc.img ./tmp || { echo "Failed to mount rootc image"; exit 1; }
 sudo cp -r ../rootc/* ./tmp/ || { echo "Failed to copy files to rootc image"; exit 1; }
 sudo umount ./tmp || { echo "Failed to umount rootc image"; exit 1; }
