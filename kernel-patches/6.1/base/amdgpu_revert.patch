@@ -1,12 +1,200 @@
---- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.c	2022-12-14 11:37:31.000000000 +0100
-+++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.c	2022-11-03 15:59:20.000000000 +0100
-@@ -149,9 +149,6 @@
- 		break;
- 	case IP_VERSION(3, 0, 2):
- 		fw_name = FIRMWARE_VANGOGH;
--		if ((adev->firmware.load_type == AMDGPU_FW_LOAD_PSP) &&
--		    (adev->pg_flags & AMD_PG_SUPPORT_VCN_DPG))
--			adev->vcn.indirect_sram = true;
- 		break;
- 	case IP_VERSION(3, 0, 16):
- 		fw_name = FIRMWARE_DIMGREY_CAVEFISH;
+From 036f550609ec7705e01890220d18891f049dd5a6 Mon Sep 17 00:00:00 2001
+From: guylamar2006 <guychronister@outlook.com>
+Date: Fri, 7 Apr 2023 23:19:17 -0500
+Subject: [PATCH] Update amdgpu_revert.patch
+
+---
+ kernel-patches/6.1/base/amdgpu_revert.patch | 186 ++++++++++++++++++--
+ 1 file changed, 174 insertions(+), 12 deletions(-)
+
+diff --git a/kernel-patches/6.1/base/amdgpu_revert.patch b/kernel-patches/6.1/base/amdgpu_revert.patch
+index 43bc9a82c..7484d0117 100644
+--- a/kernel-patches/6.1/base/amdgpu_revert.patch
++++ b/kernel-patches/6.1/base/amdgpu_revert.patch
+@@ -1,12 +1,174 @@
+---- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.c	2022-12-14 11:37:31.000000000 +0100
+-+++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.c	2022-11-03 15:59:20.000000000 +0100
+-@@ -149,9 +149,6 @@
+- 		break;
+- 	case IP_VERSION(3, 0, 2):
+- 		fw_name = FIRMWARE_VANGOGH;
+--		if ((adev->firmware.load_type == AMDGPU_FW_LOAD_PSP) &&
+--		    (adev->pg_flags & AMD_PG_SUPPORT_VCN_DPG))
+--			adev->vcn.indirect_sram = true;
+- 		break;
+- 	case IP_VERSION(3, 0, 16):
+- 		fw_name = FIRMWARE_DIMGREY_CAVEFISH;
++From 353d783ce17d391d9fd37c91b75ab5c2ec764701 Mon Sep 17 00:00:00 2001
++From: "Guilherme G. Piccoli" <gpiccoli@igalia.com>
++Date: Sun, 12 Mar 2023 13:51:00 -0300
++Subject: [PATCH 1/2] drm/amdgpu/vcn: Disable indirect SRAM on Vangogh broken
++ BIOSes
++
++The VCN firmware loading path enables the indirect SRAM mode if it's
++advertised as supported. We might have some cases of FW issues that
++prevents this mode to working properly though, ending-up in a failed
++probe. An example below, observed in the Steam Deck:
++
++[...]
++[drm] failed to load ucode VCN0_RAM(0x3A)
++[drm] psp gfx command LOAD_IP_FW(0x6) failed and response status is (0xFFFF0000)
++amdgpu 0000:04:00.0: [drm:amdgpu_ring_test_helper [amdgpu]] *ERROR* ring vcn_dec_0 test failed (-110)
++[drm:amdgpu_device_init.cold [amdgpu]] *ERROR* hw_init of IP block <vcn_v3_0> failed -110
++amdgpu 0000:04:00.0: amdgpu: amdgpu_device_ip_init failed
++amdgpu 0000:04:00.0: amdgpu: Fatal error during GPU init
++[...]
++
++Disabling the VCN block circumvents this, but it's a very invasive
++workaround that turns off the entire feature. So, let's add a quirk
++on VCN loading that checks for known problematic BIOSes on Vangogh,
++so we can proactively disable the indirect SRAM mode and allow the
++HW proper probe and VCN IP block to work fine.
++
++Bug: https://gitlab.freedesktop.org/drm/amd/-/issues/2385
++Fixes: 82132ecc5432 ("drm/amdgpu: enable Vangogh VCN indirect sram mode")
++Cc: stable@vger.kernel.org
++Cc: James Zhu <James.Zhu@amd.com>
++Cc: Leo Liu <leo.liu@amd.com>
++Signed-off-by: Guilherme G. Piccoli <gpiccoli@igalia.com>
++Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
++Link: https://gitlab.freedesktop.org/agd5f/linux/-/commit/70163f822695350651dbd2092f31915b5282c92f
++Signed-off-by: Cristian Ciocaltea <cristian.ciocaltea@collabora.com>
++---
++ drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.c | 19 +++++++++++++++++++
++ 1 file changed, 19 insertions(+)
++
++diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.c
++index 02d428ddf2f87..dc4f3f4cb644f 100644
++--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.c
+++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.c
++@@ -26,6 +26,7 @@
++ 
++ #include <linux/firmware.h>
++ #include <linux/module.h>
+++#include <linux/dmi.h>
++ #include <linux/pci.h>
++ #include <linux/debugfs.h>
++ #include <drm/drm_drv.h>
++@@ -114,6 +115,24 @@ int amdgpu_vcn_sw_init(struct amdgpu_device *adev)
++ 	    (adev->pg_flags & AMD_PG_SUPPORT_VCN_DPG))
++ 		adev->vcn.indirect_sram = true;
++ 
+++	/*
+++	 * Some Steam Deck's BIOS versions are incompatible with the
+++	 * indirect SRAM mode, leading to amdgpu being unable to get
+++	 * properly probed (and even potentially crashing the kernel).
+++	 * Hence, check for these versions here - notice this is
+++	 * restricted to Vangogh (Deck's APU).
+++	 */
+++	if (adev->ip_versions[UVD_HWIP][0] == IP_VERSION(3, 0, 2)) {
+++		const char *bios_ver = dmi_get_system_info(DMI_BIOS_VERSION);
+++
+++		if (bios_ver && (!strncmp("F7A0113", bios_ver, 7) ||
+++		     !strncmp("F7A0114", bios_ver, 7))) {
+++			adev->vcn.indirect_sram = false;
+++			dev_info(adev->dev,
+++				"Steam Deck quirk: indirect SRAM disabled on BIOS %s\n", bios_ver);
+++		}
+++	}
+++
++ 	hdr = (const struct common_firmware_header *)adev->vcn.fw->data;
++ 	adev->vcn.fw_version = le32_to_cpu(hdr->ucode_version);
++ 
++-- 
++GitLab
++
++
++From 17fbc76efc5cda70b18c4f14dd878a875d38ec58 Mon Sep 17 00:00:00 2001
++From: "Guilherme G. Piccoli" <gpiccoli@igalia.com>
++Date: Mon, 16 Jan 2023 16:09:47 -0300
++Subject: [PATCH 2/2] drm/amdgpu/vcn: Add parameter to force (en/dis)abling
++ indirect SRAM mode
++
++Currently the FW loading path perform some checks based on IP model
++and in case it is advertised as supported, the VCN indirect SRAM
++mode is used.
++
++Happens that in case there's any issue on FW and this mode ends-up
++not being properly supported, the driver probe fails [0]. Debugging
++this requires driver rebuilding, so to allow fast debug and experiments,
++add a parameter to force setting indirect SRAM mode to true/false from
++the kernel command-line; parameter default is -1, which doesn't change
++the current driver's behavior.
++
++[0] Example of this issue, observed on Steam Deck:
++
++[drm] kiq ring mec 2 pipe 1 q 0
++[drm] failed to load ucode VCN0_RAM(0x3A)
++[drm] psp gfx command LOAD_IP_FW(0x6) failed and response status is (0xFFFF0000)
++amdgpu 0000:04:00.0: [drm:amdgpu_ring_test_helper [amdgpu]] *ERROR* ring vcn_dec_0 test failed (-110)
++[drm:amdgpu_device_init.cold [amdgpu]] *ERROR* hw_init of IP block <vcn_v3_0> failed -110
++amdgpu 0000:04:00.0: amdgpu: amdgpu_device_ip_init failed
++amdgpu 0000:04:00.0: amdgpu: Fatal error during GPU init
++
++Signed-off-by: Guilherme G. Piccoli <gpiccoli@igalia.com>
++[add warning message to help with debugging]
++Signed-off-by: Cristian Ciocaltea <cristian.ciocaltea@collabora.com>
++---
++ drivers/gpu/drm/amd/amdgpu/amdgpu.h     | 1 +
++ drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c | 9 +++++++++
++ drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.c | 6 ++++++
++ 3 files changed, 16 insertions(+)
++
++diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu.h b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++index 872450a3a164c..5d3c92c94f18d 100644
++--- a/drivers/gpu/drm/amd/amdgpu/amdgpu.h
+++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu.h
++@@ -215,6 +215,7 @@ extern int amdgpu_noretry;
++ extern int amdgpu_force_asic_type;
++ extern int amdgpu_smartshift_bias;
++ extern int amdgpu_use_xgmi_p2p;
+++extern int amdgpu_indirect_sram;
++ #ifdef CONFIG_HSA_AMD
++ extern int sched_policy;
++ extern bool debug_evictions;
++diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
++index 7edbaa90fac94..5bf9edaef40f4 100644
++--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
+++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_drv.c
++@@ -188,6 +188,7 @@ int amdgpu_num_kcq = -1;
++ int amdgpu_smartshift_bias;
++ int amdgpu_use_xgmi_p2p = 1;
++ int amdgpu_vcnfw_log;
+++int amdgpu_indirect_sram = -1;
++ 
++ static void amdgpu_drv_delayed_reset_work_handler(struct work_struct *work);
++ 
++@@ -942,6 +943,14 @@ MODULE_PARM_DESC(smu_pptable_id,
++ 	"specify pptable id to be used (-1 = auto(default) value, 0 = use pptable from vbios, > 0 = soft pptable id)");
++ module_param_named(smu_pptable_id, amdgpu_smu_pptable_id, int, 0444);
++ 
+++/**
+++ * DOC: indirect_sram (int)
+++ * Allow users to force using (or not) the VCN indirect SRAM mode in the fw load
+++ * code. Default is -1, meaning auto (aka, don't mess with driver's behavior).
+++ */
+++MODULE_PARM_DESC(indirect_sram, "Force VCN indirect SRAM (-1 = auto (default), 0 = disabled, 1 = enabled)");
+++module_param_named(indirect_sram, amdgpu_indirect_sram, int, 0444);
+++
++ /* These devices are not supported by amdgpu.
++  * They are supported by the mach64, r128, radeon drivers
++  */
++diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.c
++index dc4f3f4cb644f..6651c379060a7 100644
++--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.c
+++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.c
++@@ -133,6 +133,12 @@ int amdgpu_vcn_sw_init(struct amdgpu_device *adev)
++ 		}
++ 	}
++ 
+++	if (amdgpu_indirect_sram >= 0) {
+++		adev->vcn.indirect_sram = (bool)amdgpu_indirect_sram;
+++		dev_warn(adev->dev, "Forcibly set indirect SRAM status to: %d\n",
+++			 amdgpu_indirect_sram);
+++	}
+++
++ 	hdr = (const struct common_firmware_header *)adev->vcn.fw->data;
++ 	adev->vcn.fw_version = le32_to_cpu(hdr->ucode_version);
++ 
++-- 
++GitLab
