@@ -1,101 +1,9 @@
-From febf8c75cc77baaf26a8ae869201cb1df6d67124 Mon Sep 17 00:00:00 2001
-From: Rahul Rameshbabu <rrameshbabu@nvidia.com>
-Date: Fri, 31 Mar 2023 20:21:51 -0700
-Subject: [PATCH] HID: shield: Initial driver implementation with Thunderstrike
- support
-
-Supports the Thunderstrike (SHIELD 2017) controller. Implements support for
-the Thunderstrike HOSTCMD firmware interface. Adds sysfs attributes about a
-SHIELD device and introduces haptics support for controllers.
-
-Signed-off-by: Rahul Rameshbabu <rrameshbabu@nvidia.com>
----
- MAINTAINERS              |   6 +
- drivers/hid/Kconfig      |  18 ++
- drivers/hid/Makefile     |   1 +
- drivers/hid/hid-ids.h    |   3 +
- drivers/hid/hid-shield.c | 587 +++++++++++++++++++++++++++++++++++++++
- 5 files changed, 615 insertions(+)
- create mode 100644 drivers/hid/hid-shield.c
-
-diff --git a/MAINTAINERS b/MAINTAINERS
-index 8d5bc223f3053b..27ced490e3f876 100644
---- a/MAINTAINERS
-+++ b/MAINTAINERS
-@@ -9122,6 +9122,12 @@ F:	drivers/hid/hid-sensor-*
- F:	drivers/iio/*/hid-*
- F:	include/linux/hid-sensor-*
- 
-+HID SHIELD DRIVER
-+M:	Rahul Rameshbabu <rrameshbabu@nvidia.com>
-+L:	linux-input@vger.kernel.org
-+S:	Maintained
-+F:	drivers/hid/hid-shield.c
-+
- HID VRC-2 CAR CONTROLLER DRIVER
- M:	Marcus Folkesson <marcus.folkesson@gmail.com>
- L:	linux-input@vger.kernel.org
-diff --git a/drivers/hid/Kconfig b/drivers/hid/Kconfig
-index 4ce012f83253ec..c7c97ed8534834 100644
---- a/drivers/hid/Kconfig
-+++ b/drivers/hid/Kconfig
-@@ -990,6 +990,24 @@ config HID_SEMITEK
- 	- Woo-dy
- 	- X-Bows Nature/Knight
- 
-+config HID_SHIELD
-+	tristate "SHIELD HID Driver"
-+	depends on USB_HID
-+	depends on BT_HIDP
-+	help
-+	Support for NVIDIA SHIELD accessories.
-+
-+	Supported devices:
-+	- Thunderstrike (NVIDIA SHIELD Controller 2017)
-+
-+config SHIELD_FF
-+	bool "SHIELD force feedback support"
-+	depends on HID_SHIELD
-+	select INPUT_FF_MEMLESS
-+	help
-+	Say Y here if you would like to enable force feedback support for
-+	NVIDIA SHIELD accessories with haptics capabilities.
-+
- config HID_SIGMAMICRO
- 	tristate "SiGma Micro-based keyboards"
- 	depends on USB_HID
-diff --git a/drivers/hid/Makefile b/drivers/hid/Makefile
-index 5d37cacbde33df..a2ed1db9ed9d65 100644
---- a/drivers/hid/Makefile
-+++ b/drivers/hid/Makefile
-@@ -116,6 +116,7 @@ obj-$(CONFIG_HID_RMI)		+= hid-rmi.o
- obj-$(CONFIG_HID_SAITEK)	+= hid-saitek.o
- obj-$(CONFIG_HID_SAMSUNG)	+= hid-samsung.o
- obj-$(CONFIG_HID_SEMITEK)	+= hid-semitek.o
-+obj-$(CONFIG_HID_SHIELD)	+= hid-shield.o
- obj-$(CONFIG_HID_SIGMAMICRO)	+= hid-sigmamicro.o
- obj-$(CONFIG_HID_SMARTJOYPLUS)	+= hid-sjoy.o
- obj-$(CONFIG_HID_SONY)		+= hid-sony.o
-diff --git a/drivers/hid/hid-ids.h b/drivers/hid/hid-ids.h
-index 3eb190e40165b0..724afa8151aad5 100644
---- a/drivers/hid/hid-ids.h
-+++ b/drivers/hid/hid-ids.h
-@@ -1003,6 +1003,9 @@
- #define USB_DEVICE_ID_NTRIG_TOUCH_SCREEN_18   0x0014
- #define USB_DEVICE_ID_NTRIG_DUOSENSE 0x1500
- 
-+#define USB_VENDOR_ID_NVIDIA				0x0955
-+#define USB_DEVICE_ID_NVIDIA_THUNDERSTRIKE_CONTROLLER	0x7214
-+
- #define USB_VENDOR_ID_ONTRAK		0x0a07
- #define USB_DEVICE_ID_ONTRAK_ADU100	0x0064
- 
-diff --git a/drivers/hid/hid-shield.c b/drivers/hid/hid-shield.c
+diff --git a/drivers/hid/hid-nvidia-shield.c b/drivers/hid/hid-nvidia-shield.c
 new file mode 100644
-index 00000000000000..b29af579868fd8
+index 000000000000..a928ad2be62d
 --- /dev/null
-+++ b/drivers/hid/hid-shield.c
-@@ -0,0 +1,587 @@
++++ b/drivers/hid/hid-nvidia-shield.c
+@@ -0,0 +1,738 @@
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +/*
 + *  Copyright (c) 2023, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
@@ -106,6 +14,7 @@ index 00000000000000..b29af579868fd8
 +#include <linux/hid.h>
 +#include <linux/input-event-codes.h>
 +#include <linux/input.h>
++#include <linux/leds.h>
 +#include <linux/module.h>
 +#include <linux/spinlock.h>
 +#include <linux/workqueue.h>
@@ -113,6 +22,16 @@ index 00000000000000..b29af579868fd8
 +#include "hid-ids.h"
 +
 +#define NOT_INIT_STR "NOT INITIALIZED"
++#define android_map_key(c) hid_map_usage(hi, usage, bit, max, EV_KEY, (c))
++
++enum {
++	HID_USAGE_ANDROID_PLAYPAUSE_BTN = 0xcd, /* Double-tap volume slider */
++	HID_USAGE_ANDROID_VOLUMEUP_BTN = 0xe9,
++	HID_USAGE_ANDROID_VOLUMEDOWN_BTN = 0xea,
++	HID_USAGE_ANDROID_SEARCH_BTN = 0x221, /* NVIDIA btn on Thunderstrike */
++	HID_USAGE_ANDROID_HOME_BTN = 0x223,
++	HID_USAGE_ANDROID_BACK_BTN = 0x224,
++};
 +
 +enum {
 +	SHIELD_FW_VERSION_INITIALIZED = 0,
@@ -123,6 +42,7 @@ index 00000000000000..b29af579868fd8
 +	THUNDERSTRIKE_FW_VERSION_UPDATE = 0,
 +	THUNDERSTRIKE_BOARD_INFO_UPDATE,
 +	THUNDERSTRIKE_HAPTICS_UPDATE,
++	THUNDERSTRIKE_LED_UPDATE,
 +};
 +
 +enum {
@@ -133,21 +53,28 @@ index 00000000000000..b29af579868fd8
 +
 +enum {
 +	THUNDERSTRIKE_HOSTCMD_ID_FW_VERSION = 1,
++	THUNDERSTRIKE_HOSTCMD_ID_LED = 6,
 +	THUNDERSTRIKE_HOSTCMD_ID_BOARD_INFO = 16,
 +	THUNDERSTRIKE_HOSTCMD_ID_USB_INIT = 53,
 +	THUNDERSTRIKE_HOSTCMD_ID_HAPTICS = 57,
 +	THUNDERSTRIKE_HOSTCMD_ID_BLUETOOTH_INIT = 58,
 +};
 +
++enum thunderstrike_led_state {
++	THUNDERSTRIKE_LED_OFF = 1,
++	THUNDERSTRIKE_LED_ON = 8,
++} __packed;
++static_assert(sizeof(enum thunderstrike_led_state) == 1);
++
 +struct thunderstrike_hostcmd_board_info {
 +	__le16 revision;
 +	__le16 serial[7];
-+};
++} __packed;
 +
 +struct thunderstrike_hostcmd_haptics {
 +	u8 motor_left;
 +	u8 motor_right;
-+};
++} __packed;
 +
 +struct thunderstrike_hostcmd_resp_report {
 +	u8 report_id; /* THUNDERSTRIKE_HOSTCMD_RESP_REPORT_ID */
@@ -158,8 +85,9 @@ index 00000000000000..b29af579868fd8
 +		struct thunderstrike_hostcmd_board_info board_info;
 +		struct thunderstrike_hostcmd_haptics motors;
 +		__le16 fw_version;
++		enum thunderstrike_led_state led_state;
 +		u8 payload[30];
-+	};
++	} __packed;
 +} __packed;
 +static_assert(sizeof(struct thunderstrike_hostcmd_resp_report) ==
 +	      THUNDERSTRIKE_HOSTCMD_REPORT_SIZE);
@@ -169,10 +97,16 @@ index 00000000000000..b29af579868fd8
 +	u8 cmd_id;
 +	u8 reserved_at_10;
 +
-+	struct {
-+		u8 update;
-+		struct thunderstrike_hostcmd_haptics motors;
-+	} haptics;
++	union {
++		struct __packed {
++			u8 update;
++			enum thunderstrike_led_state state;
++		} led;
++		struct __packed {
++			u8 update;
++			struct thunderstrike_hostcmd_haptics motors;
++		} haptics;
++	} __packed;
 +	u8 reserved_at_30[27];
 +} __packed;
 +static_assert(sizeof(struct thunderstrike_hostcmd_req_report) ==
@@ -196,12 +130,15 @@ index 00000000000000..b29af579868fd8
 +
 +	/* Sub-devices */
 +	struct input_dev *haptics_dev;
++	struct led_classdev led_dev;
 +
 +	/* Resources */
 +	void *req_report_dmabuf;
 +	unsigned long update_flags;
 +	struct thunderstrike_hostcmd_haptics haptics_val;
 +	spinlock_t haptics_update_lock;
++	u8 led_state : 1;
++	enum thunderstrike_led_state led_value;
 +	struct work_struct hostcmd_req_work;
 +};
 +
@@ -255,7 +192,7 @@ index 00000000000000..b29af579868fd8
 +	struct input_dev *haptics;
 +	int ret;
 +
-+	if (!IS_ENABLED(CONFIG_SHIELD_FF))
++	if (!IS_ENABLED(CONFIG_NVIDIA_SHIELD_FF))
 +		return NULL;
 +
 +	haptics = shield_allocate_input_dev(dev->hdev, "Haptics");
@@ -271,7 +208,7 @@ index 00000000000000..b29af579868fd8
 +
 +	return haptics;
 +
-+ err:
++err:
 +	input_free_device(haptics);
 +	return ERR_PTR(ret);
 +}
@@ -294,7 +231,7 @@ index 00000000000000..b29af579868fd8
 +	}
 +}
 +
-+void thunderstrike_hostcmd_req_work_handler(struct work_struct *work)
++static void thunderstrike_hostcmd_req_work_handler(struct work_struct *work)
 +{
 +	struct thunderstrike *ts =
 +		container_of(work, struct thunderstrike, hostcmd_req_work);
@@ -306,6 +243,13 @@ index 00000000000000..b29af579868fd8
 +	if (test_and_clear_bit(THUNDERSTRIKE_FW_VERSION_UPDATE, &ts->update_flags)) {
 +		thunderstrike_hostcmd_req_report_init(
 +			report, THUNDERSTRIKE_HOSTCMD_ID_FW_VERSION);
++		thunderstrike_send_hostcmd_request(ts);
++	}
++
++	if (test_and_clear_bit(THUNDERSTRIKE_LED_UPDATE, &ts->update_flags)) {
++		thunderstrike_hostcmd_req_report_init(report, THUNDERSTRIKE_HOSTCMD_ID_LED);
++		report->led.update = 1;
++		report->led.state = ts->led_value;
 +		thunderstrike_send_hostcmd_request(ts);
 +	}
 +
@@ -380,6 +324,40 @@ index 00000000000000..b29af579868fd8
 +	return thunderstrike_update_haptics(ts, &motors);
 +}
 +
++static enum led_brightness
++thunderstrike_led_get_brightness(struct led_classdev *led)
++{
++	struct hid_device *hdev = to_hid_device(led->dev->parent);
++	struct shield_device *shield_dev = hid_get_drvdata(hdev);
++	struct thunderstrike *ts;
++
++	ts = container_of(shield_dev, struct thunderstrike, base);
++
++	return ts->led_state;
++}
++
++static void thunderstrike_led_set_brightness(struct led_classdev *led,
++					    enum led_brightness value)
++{
++	struct hid_device *hdev = to_hid_device(led->dev->parent);
++	struct shield_device *shield_dev = hid_get_drvdata(hdev);
++	struct thunderstrike *ts;
++
++	ts = container_of(shield_dev, struct thunderstrike, base);
++
++	switch (value) {
++	case LED_OFF:
++		ts->led_value = THUNDERSTRIKE_LED_OFF;
++		break;
++	default:
++		ts->led_value = THUNDERSTRIKE_LED_ON;
++		break;
++	}
++
++	set_bit(THUNDERSTRIKE_LED_UPDATE, &ts->update_flags);
++	schedule_work(&ts->hostcmd_req_work);
++}
++
 +static void
 +thunderstrike_parse_fw_version_payload(struct shield_device *shield_dev,
 +				       __le16 fw_version)
@@ -426,6 +404,24 @@ index 00000000000000..b29af579868fd8
 +		haptics->motor_left, haptics->motor_right);
 +}
 +
++static void
++thunderstrike_parse_led_payload(struct shield_device *shield_dev,
++				enum thunderstrike_led_state led_state)
++{
++	struct thunderstrike *ts = container_of(shield_dev, struct thunderstrike, base);
++
++	switch (led_state) {
++	case THUNDERSTRIKE_LED_OFF:
++		ts->led_state = 0;
++		break;
++	case THUNDERSTRIKE_LED_ON:
++		ts->led_state = 1;
++		break;
++	}
++
++	hid_dbg(shield_dev->hdev, "Thunderstrike led HOSTCMD response, 0x%02X\n", led_state);
++}
++
 +static int thunderstrike_parse_report(struct shield_device *shield_dev,
 +				      struct hid_report *report, u8 *data,
 +				      int size)
@@ -451,6 +447,9 @@ index 00000000000000..b29af579868fd8
 +		case THUNDERSTRIKE_HOSTCMD_ID_FW_VERSION:
 +			thunderstrike_parse_fw_version_payload(
 +				shield_dev, hostcmd_resp_report->fw_version);
++			break;
++		case THUNDERSTRIKE_HOSTCMD_ID_LED:
++			thunderstrike_parse_led_payload(shield_dev, hostcmd_resp_report->led_state);
 +			break;
 +		case THUNDERSTRIKE_HOSTCMD_ID_BOARD_INFO:
 +			thunderstrike_parse_board_info_payload(
@@ -483,10 +482,24 @@ index 00000000000000..b29af579868fd8
 +	return 0;
 +}
 +
++static inline int thunderstrike_led_create(struct thunderstrike *ts)
++{
++	struct led_classdev *led = &ts->led_dev;
++
++	led->name = "thunderstrike:blue:led";
++	led->max_brightness = 1;
++	led->flags = LED_CORE_SUSPENDRESUME;
++	led->brightness_get = &thunderstrike_led_get_brightness;
++	led->brightness_set = &thunderstrike_led_set_brightness;
++
++	return led_classdev_register(&ts->base.hdev->dev, led);
++}
++
 +static struct shield_device *thunderstrike_create(struct hid_device *hdev)
 +{
 +	struct shield_device *shield_dev;
 +	struct thunderstrike *ts;
++	int ret;
 +
 +	ts = devm_kzalloc(&hdev->dev, sizeof(*ts), GFP_KERNEL);
 +	if (!ts)
@@ -506,12 +519,56 @@ index 00000000000000..b29af579868fd8
 +
 +	hid_set_drvdata(hdev, shield_dev);
 +
++	ret = thunderstrike_led_create(ts);
++	if (ret) {
++		hid_err(hdev, "Failed to create Thunderstrike LED instance\n");
++		return ERR_PTR(ret);
++	}
++
 +	ts->haptics_dev = shield_haptics_create(shield_dev, thunderstrike_play_effect);
 +	if (IS_ERR(ts->haptics_dev))
-+		return ERR_CAST(ts->haptics_dev);
++		goto err;
 +
 +	hid_info(hdev, "Registered Thunderstrike controller\n");
 +	return shield_dev;
++
++err:
++	led_classdev_unregister(&ts->led_dev);
++	return ERR_CAST(ts->haptics_dev);
++}
++
++static int android_input_mapping(struct hid_device *hdev, struct hid_input *hi,
++				 struct hid_field *field,
++				 struct hid_usage *usage, unsigned long **bit,
++				 int *max)
++{
++	if ((usage->hid & HID_USAGE_PAGE) != HID_UP_CONSUMER)
++		return 0;
++
++	switch (usage->hid & HID_USAGE) {
++	case HID_USAGE_ANDROID_PLAYPAUSE_BTN:
++		android_map_key(KEY_PLAYPAUSE);
++		break;
++	case HID_USAGE_ANDROID_VOLUMEUP_BTN:
++		android_map_key(KEY_VOLUMEUP);
++		break;
++	case HID_USAGE_ANDROID_VOLUMEDOWN_BTN:
++		android_map_key(KEY_VOLUMEDOWN);
++		break;
++	case HID_USAGE_ANDROID_SEARCH_BTN:
++		android_map_key(BTN_Z);
++		break;
++	case HID_USAGE_ANDROID_HOME_BTN:
++		android_map_key(BTN_MODE);
++		break;
++	case HID_USAGE_ANDROID_BACK_BTN:
++		android_map_key(BTN_SELECT);
++		break;
++	default:
++		return 0;
++	}
++
++	return 1;
 +}
 +
 +static ssize_t firmware_version_show(struct device *dev,
@@ -653,6 +710,7 @@ index 00000000000000..b29af579868fd8
 +	ts = container_of(dev, struct thunderstrike, base);
 +
 +	hid_hw_close(hdev);
++	led_classdev_unregister(&ts->led_dev);
 +	if (ts->haptics_dev)
 +		input_unregister_device(ts->haptics_dev);
 +	cancel_work_sync(&ts->hostcmd_req_work);
@@ -664,16 +722,17 @@ index 00000000000000..b29af579868fd8
 +			       USB_DEVICE_ID_NVIDIA_THUNDERSTRIKE_CONTROLLER) },
 +	{ HID_USB_DEVICE(USB_VENDOR_ID_NVIDIA,
 +			 USB_DEVICE_ID_NVIDIA_THUNDERSTRIKE_CONTROLLER) },
-+	{}
++	{ }
 +};
 +MODULE_DEVICE_TABLE(hid, shield_devices);
 +
 +static struct hid_driver shield_driver = {
-+	.name         = "shield",
-+	.id_table     = shield_devices,
-+	.probe        = shield_probe,
-+	.remove       = shield_remove,
-+	.raw_event    = shield_raw_event,
++	.name          = "shield",
++	.id_table      = shield_devices,
++	.input_mapping = android_input_mapping,
++	.probe         = shield_probe,
++	.remove        = shield_remove,
++	.raw_event     = shield_raw_event,
 +	.driver = {
 +		.dev_groups = shield_device_groups,
 +	},
@@ -683,3 +742,75 @@ index 00000000000000..b29af579868fd8
 +MODULE_AUTHOR("Rahul Rameshbabu <rrameshbabu@nvidia.com>");
 +MODULE_DESCRIPTION("HID Driver for NVIDIA SHIELD peripherals.");
 +MODULE_LICENSE("GPL");
+diff --git a/drivers/hid/hid-ids.h b/drivers/hid/hid-ids.h
+index 15fdeedfda38..4c956165c6a8 100644
+--- a/drivers/hid/hid-ids.h
++++ b/drivers/hid/hid-ids.h
+@@ -993,6 +993,9 @@
+ #define USB_DEVICE_ID_NTRIG_TOUCH_SCREEN_18   0x0014
+ #define USB_DEVICE_ID_NTRIG_DUOSENSE 0x1500
+ 
++#define USB_VENDOR_ID_NVIDIA                           0x0955
++#define USB_DEVICE_ID_NVIDIA_THUNDERSTRIKE_CONTROLLER  0x7214
++
+ #define USB_VENDOR_ID_ONTRAK		0x0a07
+ #define USB_DEVICE_ID_ONTRAK_ADU100	0x0064
+ 
+diff --git a/MAINTAINERS b/MAINTAINERS
+index 41de723356af..7b66a7b7a48a 100644
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -9137,6 +9137,12 @@ L:	linux-input@vger.kernel.org
+ S:	Maintained
+ F:	drivers/hid/hid-logitech-*
+ 
++HID NVIDIA SHIELD DRIVER
++M:	Rahul Rameshbabu <rrameshbabu@nvidia.com>
++L:	linux-input@vger.kernel.org
++S:	Maintained
++F:	drivers/hid/hid-nvidia-shield.c
++
+ HID PLAYSTATION DRIVER
+ M:	Roderick Colenbrander <roderick.colenbrander@sony.com>
+ L:	linux-input@vger.kernel.org
+diff --git a/drivers/hid/Makefile b/drivers/hid/Makefile
+index 9e968c1181e3..5575603726b5 100644
+--- a/drivers/hid/Makefile
++++ b/drivers/hid/Makefile
+@@ -84,6 +84,7 @@ obj-$(CONFIG_HID_MULTITOUCH)	+= hid-multitouch.o
+ obj-$(CONFIG_HID_NINTENDO)	+= hid-nintendo.o
+ obj-$(CONFIG_HID_NTI)			+= hid-nti.o
+ obj-$(CONFIG_HID_NTRIG)		+= hid-ntrig.o
++obj-$(CONFIG_HID_NVIDIA_SHIELD)	+= hid-nvidia-shield.o
+ obj-$(CONFIG_HID_ORTEK)		+= hid-ortek.o
+ obj-$(CONFIG_HID_PRODIKEYS)	+= hid-prodikeys.o
+ obj-$(CONFIG_HID_PANTHERLORD)	+= hid-pl.o
+diff --git a/drivers/hid/Kconfig b/drivers/hid/Kconfig
+index 106398115477..1d08d9ad607d 100644
+--- a/drivers/hid/Kconfig
++++ b/drivers/hid/Kconfig
+@@ -774,6 +774,24 @@ config HID_NTRIG
+ 	help
+ 	Support for N-Trig touch screen.
+ 
++config HID_NVIDIA_SHIELD
++	tristate "NVIDIA SHIELD devices"
++	depends on USB_HID
++	depends on BT_HIDP
++	help
++	  Support for NVIDIA SHIELD accessories.
++
++	  Supported devices:
++	  - Thunderstrike (NVIDIA SHIELD Controller 2017)
++
++config NVIDIA_SHIELD_FF
++	bool "NVIDIA SHIELD force feedback support"
++	depends on HID_NVIDIA_SHIELD
++	select INPUT_FF_MEMLESS
++	help
++	  Say Y here if you would like to enable force feedback support for
++	  NVIDIA SHIELD accessories with haptics capabilities.
++
+ config HID_ORTEK
+ 	tristate "Ortek PKB-1700/WKB-2000/Skycable wireless keyboard and mouse trackpad"
+ 	help
