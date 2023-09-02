@@ -334,6 +334,7 @@ cp -r ../../../../extra-firmwares/* ./out/ || { echo "Failed to copy brunch extr
 mkdir -p ../rootc/lib/firmware || { echo "Failed to make firmware directory"; exit 1; }
 curl https://archlinux.org/packages/core/any/amd-ucode/download/ -Lo ../rootc/lib/firmware/amd-ucode.tar.zst ; curl https://archlinux.org/packages/extra/any/intel-ucode/download/ -Lo ../rootc/lib/firmware/intel-ucode.tar.zst || { echo "Failed to download intel / amd ucode"; exit 1; }
 zstd -d ../rootc/lib/firmware/amd-ucode.tar.zst ; zstd -d ../rootc/lib/firmware/intel-ucode.tar.zst || { echo "Failed to decompress intel / amd ucode zst files"; exit 1; }
+tar xvf ../rootc/lib/firmware/amd-ucode.tar boot/amd-ucode.img -O > ../rootc/lib/firmware/amd-ucode.img ; tar xvf ../rootc/lib/firmware/intel-ucode.tar boot/intel-ucode.img -O > ../rootc/lib/firmware/intel-ucode.img || { echo "Failed to copy intel / amd ucode"; exit 1; }
 cd ./out || { echo "Failed to enter the final firmware directory"; exit 1; }
 tar zcf ../../rootc/packages/firmwares.tar.gz * --owner=0 --group=0 || { echo "Failed to create the firmwares archive"; exit 1; }
 cd ../.. || { echo "Failed to cleanup firmwares directory"; exit 1; }
