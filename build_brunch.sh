@@ -32,7 +32,7 @@ if [ ! -z $1 ] && [ "$1" != "skip" ] ; then
 else
 	git clone -b master https://github.com/sebanc/chromeos-ota-extract.git rootfs || { echo "Failed to clone chromeos-ota-extract"; exit 1; }
 	cd rootfs
-	curl -L https://dl.google.com/chromeos/rammus/15509.81.0/stable-channel/chromeos_15509.81.0_rammus_stable-channel_full_mp-v3.bin-gy2gmztfmu3gj5up5xkpxucq3n7mum2u.signed -o ./update.signed || { echo "Failed to Download the OTA update"; exit 1; }
+	curl -L https://dl.google.com/chromeos/rammus/15604.57.0/stable-channel/chromeos_15604.57.0_rammus_stable-channel_full_mp-v3.bin-gy2tgyrvgyydbr3dkz5iqxodi6tym6w7.signed -o ./update.signed || { echo "Failed to Download the OTA update"; exit 1; }
 	python3 extract_android_ota_payload.py ./update.signed || { echo "Failed to extract the OTA update"; exit 1; }
 	cd ..
 	[ -f ./rootfs/root.img ] || { echo "ChromeOS rootfs has not been extracted"; exit 1; }
@@ -67,8 +67,8 @@ mkdir ./chroot/home/chronos/rootc || { echo "Failed to create rootc directory"; 
 ln -s kernel-6.1 ./chroot/home/chronos/rootc/kernel || { echo "Failed to make the default kernel symlink"; exit 1; }
 ln -s kernel ./chroot/home/chronos/rootc/kernel-4.19 || { echo "Failed to make the legacy kernel symlink"; exit 1; }
 ln -s kernel ./chroot/home/chronos/rootc/kernel-5.4 || { echo "Failed to make the legacy kernel symlink"; exit 1; }
-ln -s kernel-chromebook-5.15 ./chroot/home/chronos/rootc/kernel-macbook || { echo "Failed to make the macbook kernel symlink"; exit 1; }
-ln -s kernel-chromebook-5.15 ./chroot/home/chronos/rootc/kernel-macbook-t2 || { echo "Failed to make the macbook kernel symlink"; exit 1; }
+ln -s kernel-chromebook-6.1 ./chroot/home/chronos/rootc/kernel-macbook || { echo "Failed to make the macbook kernel symlink"; exit 1; }
+ln -s kernel-chromebook-6.1 ./chroot/home/chronos/rootc/kernel-macbook-t2 || { echo "Failed to make the macbook kernel symlink"; exit 1; }
 cp -r ./packages ./chroot/home/chronos/rootc/ || { echo "Failed to copy brunch packages"; exit 1; }
 cp -r ./brunch-patches ./chroot/home/chronos/rootc/patches || { echo "Failed to copy brunch patches"; exit 1; }
 chmod -R 0755 ./chroot/home/chronos/rootc/patches || { echo "Failed to change patches directory permissions"; exit 1; }
