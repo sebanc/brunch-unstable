@@ -1,101 +1,9 @@
-From febf8c75cc77baaf26a8ae869201cb1df6d67124 Mon Sep 17 00:00:00 2001
-From: Rahul Rameshbabu <rrameshbabu@nvidia.com>
-Date: Fri, 31 Mar 2023 20:21:51 -0700
-Subject: [PATCH] HID: shield: Initial driver implementation with Thunderstrike
- support
-
-Supports the Thunderstrike (SHIELD 2017) controller. Implements support for
-the Thunderstrike HOSTCMD firmware interface. Adds sysfs attributes about a
-SHIELD device and introduces haptics support for controllers.
-
-Signed-off-by: Rahul Rameshbabu <rrameshbabu@nvidia.com>
----
- MAINTAINERS              |   6 +
- drivers/hid/Kconfig      |  18 ++
- drivers/hid/Makefile     |   1 +
- drivers/hid/hid-ids.h    |   3 +
- drivers/hid/hid-shield.c | 587 +++++++++++++++++++++++++++++++++++++++
- 5 files changed, 615 insertions(+)
- create mode 100644 drivers/hid/hid-shield.c
-
-diff --git a/MAINTAINERS b/MAINTAINERS
-index 8d5bc223f3053b..27ced490e3f876 100644
---- a/MAINTAINERS
-+++ b/MAINTAINERS
-@@ -9122,6 +9122,12 @@ F:	drivers/hid/hid-sensor-*
- F:	drivers/iio/*/hid-*
- F:	include/linux/hid-sensor-*
- 
-+HID SHIELD DRIVER
-+M:	Rahul Rameshbabu <rrameshbabu@nvidia.com>
-+L:	linux-input@vger.kernel.org
-+S:	Maintained
-+F:	drivers/hid/hid-shield.c
-+
- HID VRC-2 CAR CONTROLLER DRIVER
- M:	Marcus Folkesson <marcus.folkesson@gmail.com>
- L:	linux-input@vger.kernel.org
-diff --git a/drivers/hid/Kconfig b/drivers/hid/Kconfig
-index 4ce012f83253ec..c7c97ed8534834 100644
---- a/drivers/hid/Kconfig
-+++ b/drivers/hid/Kconfig
-@@ -990,6 +990,24 @@ config HID_SEMITEK
- 	- Woo-dy
- 	- X-Bows Nature/Knight
- 
-+config HID_SHIELD
-+	tristate "SHIELD HID Driver"
-+	depends on USB_HID
-+	depends on BT_HIDP
-+	help
-+	Support for NVIDIA SHIELD accessories.
-+
-+	Supported devices:
-+	- Thunderstrike (NVIDIA SHIELD Controller 2017)
-+
-+config SHIELD_FF
-+	bool "SHIELD force feedback support"
-+	depends on HID_SHIELD
-+	select INPUT_FF_MEMLESS
-+	help
-+	Say Y here if you would like to enable force feedback support for
-+	NVIDIA SHIELD accessories with haptics capabilities.
-+
- config HID_SIGMAMICRO
- 	tristate "SiGma Micro-based keyboards"
- 	depends on USB_HID
-diff --git a/drivers/hid/Makefile b/drivers/hid/Makefile
-index 5d37cacbde33df..a2ed1db9ed9d65 100644
---- a/drivers/hid/Makefile
-+++ b/drivers/hid/Makefile
-@@ -116,6 +116,7 @@ obj-$(CONFIG_HID_RMI)		+= hid-rmi.o
- obj-$(CONFIG_HID_SAITEK)	+= hid-saitek.o
- obj-$(CONFIG_HID_SAMSUNG)	+= hid-samsung.o
- obj-$(CONFIG_HID_SEMITEK)	+= hid-semitek.o
-+obj-$(CONFIG_HID_SHIELD)	+= hid-shield.o
- obj-$(CONFIG_HID_SIGMAMICRO)	+= hid-sigmamicro.o
- obj-$(CONFIG_HID_SMARTJOYPLUS)	+= hid-sjoy.o
- obj-$(CONFIG_HID_SONY)		+= hid-sony.o
-diff --git a/drivers/hid/hid-ids.h b/drivers/hid/hid-ids.h
-index 3eb190e40165b0..724afa8151aad5 100644
---- a/drivers/hid/hid-ids.h
-+++ b/drivers/hid/hid-ids.h
-@@ -1003,6 +1003,9 @@
- #define USB_DEVICE_ID_NTRIG_TOUCH_SCREEN_18   0x0014
- #define USB_DEVICE_ID_NTRIG_DUOSENSE 0x1500
- 
-+#define USB_VENDOR_ID_NVIDIA				0x0955
-+#define USB_DEVICE_ID_NVIDIA_THUNDERSTRIKE_CONTROLLER	0x7214
-+
- #define USB_VENDOR_ID_ONTRAK		0x0a07
- #define USB_DEVICE_ID_ONTRAK_ADU100	0x0064
- 
-diff --git a/drivers/hid/hid-shield.c b/drivers/hid/hid-shield.c
+diff --git a/drivers/hid/hid-nvidia-shield.c b/drivers/hid/hid-nvidia-shield.c
 new file mode 100644
-index 00000000000000..b29af579868fd8
+index 000000000000..82d0a77359c4
 --- /dev/null
-+++ b/drivers/hid/hid-shield.c
-@@ -0,0 +1,587 @@
++++ b/drivers/hid/hid-nvidia-shield.c
+@@ -0,0 +1,1128 @@
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +/*
 + *  Copyright (c) 2023, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
@@ -104,25 +12,44 @@ index 00000000000000..b29af579868fd8
 + */
 +
 +#include <linux/hid.h>
++#include <linux/idr.h>
 +#include <linux/input-event-codes.h>
 +#include <linux/input.h>
++#include <linux/jiffies.h>
++#include <linux/leds.h>
 +#include <linux/module.h>
++#include <linux/power_supply.h>
 +#include <linux/spinlock.h>
++#include <linux/timer.h>
 +#include <linux/workqueue.h>
 +
 +#include "hid-ids.h"
 +
 +#define NOT_INIT_STR "NOT INITIALIZED"
++#define android_map_key(c) hid_map_usage(hi, usage, bit, max, EV_KEY, (c))
++
++enum {
++	HID_USAGE_ANDROID_PLAYPAUSE_BTN = 0xcd, /* Double-tap volume slider */
++	HID_USAGE_ANDROID_VOLUMEUP_BTN = 0xe9,
++	HID_USAGE_ANDROID_VOLUMEDOWN_BTN = 0xea,
++	HID_USAGE_ANDROID_SEARCH_BTN = 0x221, /* NVIDIA btn on Thunderstrike */
++	HID_USAGE_ANDROID_HOME_BTN = 0x223,
++	HID_USAGE_ANDROID_BACK_BTN = 0x224,
++};
 +
 +enum {
 +	SHIELD_FW_VERSION_INITIALIZED = 0,
 +	SHIELD_BOARD_INFO_INITIALIZED,
++	SHIELD_BATTERY_STATS_INITIALIZED,
++	SHIELD_CHARGER_STATE_INITIALIZED,
 +};
 +
 +enum {
 +	THUNDERSTRIKE_FW_VERSION_UPDATE = 0,
 +	THUNDERSTRIKE_BOARD_INFO_UPDATE,
 +	THUNDERSTRIKE_HAPTICS_UPDATE,
++	THUNDERSTRIKE_LED_UPDATE,
++	THUNDERSTRIKE_POWER_SUPPLY_STATS_UPDATE,
 +};
 +
 +enum {
@@ -133,21 +60,96 @@ index 00000000000000..b29af579868fd8
 +
 +enum {
 +	THUNDERSTRIKE_HOSTCMD_ID_FW_VERSION = 1,
++	THUNDERSTRIKE_HOSTCMD_ID_LED = 6,
++	THUNDERSTRIKE_HOSTCMD_ID_BATTERY,
 +	THUNDERSTRIKE_HOSTCMD_ID_BOARD_INFO = 16,
 +	THUNDERSTRIKE_HOSTCMD_ID_USB_INIT = 53,
 +	THUNDERSTRIKE_HOSTCMD_ID_HAPTICS = 57,
-+	THUNDERSTRIKE_HOSTCMD_ID_BLUETOOTH_INIT = 58,
++	THUNDERSTRIKE_HOSTCMD_ID_CHARGER,
 +};
++
++struct power_supply_dev {
++	struct power_supply *psy;
++	struct power_supply_desc desc;
++};
++
++struct thunderstrike_psy_prop_values {
++	int voltage_min;
++	int voltage_now;
++	int voltage_avg;
++	int voltage_boot;
++	int capacity;
++	int status;
++	int charge_type;
++	int temp;
++};
++
++static const enum power_supply_property thunderstrike_battery_props[] = {
++	POWER_SUPPLY_PROP_STATUS,
++	POWER_SUPPLY_PROP_CHARGE_TYPE,
++	POWER_SUPPLY_PROP_PRESENT,
++	POWER_SUPPLY_PROP_VOLTAGE_MIN,
++	POWER_SUPPLY_PROP_VOLTAGE_MAX_DESIGN,
++	POWER_SUPPLY_PROP_VOLTAGE_MIN_DESIGN,
++	POWER_SUPPLY_PROP_VOLTAGE_NOW,
++	POWER_SUPPLY_PROP_VOLTAGE_AVG,
++	POWER_SUPPLY_PROP_VOLTAGE_BOOT,
++	POWER_SUPPLY_PROP_CAPACITY,
++	POWER_SUPPLY_PROP_SCOPE,
++	POWER_SUPPLY_PROP_TEMP,
++	POWER_SUPPLY_PROP_TEMP_MIN,
++	POWER_SUPPLY_PROP_TEMP_MAX,
++	POWER_SUPPLY_PROP_TEMP_ALERT_MIN,
++	POWER_SUPPLY_PROP_TEMP_ALERT_MAX,
++};
++
++enum thunderstrike_led_state {
++	THUNDERSTRIKE_LED_OFF = 1,
++	THUNDERSTRIKE_LED_ON = 8,
++} __packed;
++static_assert(sizeof(enum thunderstrike_led_state) == 1);
++
++struct thunderstrike_hostcmd_battery {
++	__le16 voltage_avg;
++	u8 reserved_at_10;
++	__le16 thermistor;
++	__le16 voltage_min;
++	__le16 voltage_boot;
++	__le16 voltage_now;
++	u8 capacity;
++} __packed;
++
++enum thunderstrike_charger_type {
++	THUNDERSTRIKE_CHARGER_TYPE_NONE = 0,
++	THUNDERSTRIKE_CHARGER_TYPE_TRICKLE,
++	THUNDERSTRIKE_CHARGER_TYPE_NORMAL,
++} __packed;
++static_assert(sizeof(enum thunderstrike_charger_type) == 1);
++
++enum thunderstrike_charger_state {
++	THUNDERSTRIKE_CHARGER_STATE_UNKNOWN = 0,
++	THUNDERSTRIKE_CHARGER_STATE_DISABLED,
++	THUNDERSTRIKE_CHARGER_STATE_CHARGING,
++	THUNDERSTRIKE_CHARGER_STATE_FULL,
++	THUNDERSTRIKE_CHARGER_STATE_FAILED = 8,
++} __packed;
++static_assert(sizeof(enum thunderstrike_charger_state) == 1);
++
++struct thunderstrike_hostcmd_charger {
++	u8 connected;
++	enum thunderstrike_charger_type type;
++	enum thunderstrike_charger_state state;
++} __packed;
 +
 +struct thunderstrike_hostcmd_board_info {
 +	__le16 revision;
 +	__le16 serial[7];
-+};
++} __packed;
 +
 +struct thunderstrike_hostcmd_haptics {
 +	u8 motor_left;
 +	u8 motor_right;
-+};
++} __packed;
 +
 +struct thunderstrike_hostcmd_resp_report {
 +	u8 report_id; /* THUNDERSTRIKE_HOSTCMD_RESP_REPORT_ID */
@@ -158,8 +160,11 @@ index 00000000000000..b29af579868fd8
 +		struct thunderstrike_hostcmd_board_info board_info;
 +		struct thunderstrike_hostcmd_haptics motors;
 +		__le16 fw_version;
++		enum thunderstrike_led_state led_state;
++		struct thunderstrike_hostcmd_battery battery;
++		struct thunderstrike_hostcmd_charger charger;
 +		u8 payload[30];
-+	};
++	} __packed;
 +} __packed;
 +static_assert(sizeof(struct thunderstrike_hostcmd_resp_report) ==
 +	      THUNDERSTRIKE_HOSTCMD_REPORT_SIZE);
@@ -169,10 +174,16 @@ index 00000000000000..b29af579868fd8
 +	u8 cmd_id;
 +	u8 reserved_at_10;
 +
-+	struct {
-+		u8 update;
-+		struct thunderstrike_hostcmd_haptics motors;
-+	} haptics;
++	union {
++		struct __packed {
++			u8 update;
++			enum thunderstrike_led_state state;
++		} led;
++		struct __packed {
++			u8 update;
++			struct thunderstrike_hostcmd_haptics motors;
++		} haptics;
++	} __packed;
 +	u8 reserved_at_30[27];
 +} __packed;
 +static_assert(sizeof(struct thunderstrike_hostcmd_req_report) ==
@@ -181,6 +192,7 @@ index 00000000000000..b29af579868fd8
 +/* Common struct for shield accessories. */
 +struct shield_device {
 +	struct hid_device *hdev;
++	struct power_supply_dev battery_dev;
 +
 +	unsigned long initialized_flags;
 +	const char *codename;
@@ -191,17 +203,31 @@ index 00000000000000..b29af579868fd8
 +	} board_info;
 +};
 +
++/*
++ * Non-trivial to uniquely identify Thunderstrike controllers at initialization
++ * time. Use an ID allocator to help with this.
++ */
++static DEFINE_IDA(thunderstrike_ida);
++
 +struct thunderstrike {
 +	struct shield_device base;
 +
++	int id;
++
 +	/* Sub-devices */
 +	struct input_dev *haptics_dev;
++	struct led_classdev led_dev;
 +
 +	/* Resources */
 +	void *req_report_dmabuf;
 +	unsigned long update_flags;
 +	struct thunderstrike_hostcmd_haptics haptics_val;
 +	spinlock_t haptics_update_lock;
++	u8 led_state : 1;
++	enum thunderstrike_led_state led_value;
++	struct thunderstrike_psy_prop_values psy_stats;
++	spinlock_t psy_stats_lock;
++	struct timer_list psy_stats_timer;
 +	struct work_struct hostcmd_req_work;
 +};
 +
@@ -233,7 +259,7 @@ index 00000000000000..b29af579868fd8
 +	idev->id.product = hdev->product;
 +	idev->id.version = hdev->version;
 +	idev->uniq = hdev->uniq;
-+	idev->name = devm_kasprintf(&idev->dev, GFP_KERNEL, "%s %s", hdev->name,
++	idev->name = devm_kasprintf(&hdev->dev, GFP_KERNEL, "%s %s", hdev->name,
 +				    name_suffix);
 +	if (!idev->name)
 +		goto err_name;
@@ -255,7 +281,7 @@ index 00000000000000..b29af579868fd8
 +	struct input_dev *haptics;
 +	int ret;
 +
-+	if (!IS_ENABLED(CONFIG_SHIELD_FF))
++	if (!IS_ENABLED(CONFIG_NVIDIA_SHIELD_FF))
 +		return NULL;
 +
 +	haptics = shield_allocate_input_dev(dev->hdev, "Haptics");
@@ -271,7 +297,7 @@ index 00000000000000..b29af579868fd8
 +
 +	return haptics;
 +
-+ err:
++err:
 +	input_free_device(haptics);
 +	return ERR_PTR(ret);
 +}
@@ -294,7 +320,7 @@ index 00000000000000..b29af579868fd8
 +	}
 +}
 +
-+void thunderstrike_hostcmd_req_work_handler(struct work_struct *work)
++static void thunderstrike_hostcmd_req_work_handler(struct work_struct *work)
 +{
 +	struct thunderstrike *ts =
 +		container_of(work, struct thunderstrike, hostcmd_req_work);
@@ -306,6 +332,23 @@ index 00000000000000..b29af579868fd8
 +	if (test_and_clear_bit(THUNDERSTRIKE_FW_VERSION_UPDATE, &ts->update_flags)) {
 +		thunderstrike_hostcmd_req_report_init(
 +			report, THUNDERSTRIKE_HOSTCMD_ID_FW_VERSION);
++		thunderstrike_send_hostcmd_request(ts);
++	}
++
++	if (test_and_clear_bit(THUNDERSTRIKE_LED_UPDATE, &ts->update_flags)) {
++		thunderstrike_hostcmd_req_report_init(report, THUNDERSTRIKE_HOSTCMD_ID_LED);
++		report->led.update = 1;
++		report->led.state = ts->led_value;
++		thunderstrike_send_hostcmd_request(ts);
++	}
++
++	if (test_and_clear_bit(THUNDERSTRIKE_POWER_SUPPLY_STATS_UPDATE, &ts->update_flags)) {
++		thunderstrike_hostcmd_req_report_init(
++			report, THUNDERSTRIKE_HOSTCMD_ID_BATTERY);
++		thunderstrike_send_hostcmd_request(ts);
++
++		thunderstrike_hostcmd_req_report_init(
++			report, THUNDERSTRIKE_HOSTCMD_ID_CHARGER);
 +		thunderstrike_send_hostcmd_request(ts);
 +	}
 +
@@ -380,6 +423,127 @@ index 00000000000000..b29af579868fd8
 +	return thunderstrike_update_haptics(ts, &motors);
 +}
 +
++static enum led_brightness
++thunderstrike_led_get_brightness(struct led_classdev *led)
++{
++	struct hid_device *hdev = to_hid_device(led->dev->parent);
++	struct shield_device *shield_dev = hid_get_drvdata(hdev);
++	struct thunderstrike *ts;
++
++	ts = container_of(shield_dev, struct thunderstrike, base);
++
++	return ts->led_state;
++}
++
++static void thunderstrike_led_set_brightness(struct led_classdev *led,
++					    enum led_brightness value)
++{
++	struct hid_device *hdev = to_hid_device(led->dev->parent);
++	struct shield_device *shield_dev = hid_get_drvdata(hdev);
++	struct thunderstrike *ts;
++
++	ts = container_of(shield_dev, struct thunderstrike, base);
++
++	switch (value) {
++	case LED_OFF:
++		ts->led_value = THUNDERSTRIKE_LED_OFF;
++		break;
++	default:
++		ts->led_value = THUNDERSTRIKE_LED_ON;
++		break;
++	}
++
++	set_bit(THUNDERSTRIKE_LED_UPDATE, &ts->update_flags);
++	schedule_work(&ts->hostcmd_req_work);
++}
++
++static int thunderstrike_battery_get_property(struct power_supply *psy,
++					      enum power_supply_property psp,
++					      union power_supply_propval *val)
++{
++	struct shield_device *shield_dev = power_supply_get_drvdata(psy);
++	struct thunderstrike_psy_prop_values prop_values;
++	struct thunderstrike *ts;
++	int ret = 0;
++
++	ts = container_of(shield_dev, struct thunderstrike, base);
++	spin_lock(&ts->psy_stats_lock);
++	prop_values = ts->psy_stats;
++	spin_unlock(&ts->psy_stats_lock);
++
++	switch (psp) {
++	case POWER_SUPPLY_PROP_STATUS:
++		val->intval = prop_values.status;
++		break;
++	case POWER_SUPPLY_PROP_CHARGE_TYPE:
++		val->intval = prop_values.charge_type;
++		break;
++	case POWER_SUPPLY_PROP_PRESENT:
++		val->intval = 1;
++		break;
++	case POWER_SUPPLY_PROP_VOLTAGE_MIN:
++		val->intval = prop_values.voltage_min;
++		break;
++	case POWER_SUPPLY_PROP_VOLTAGE_MAX_DESIGN:
++		val->intval = 2900000; /* 2.9 V */
++		break;
++	case POWER_SUPPLY_PROP_VOLTAGE_MIN_DESIGN:
++		val->intval = 2200000; /* 2.2 V */
++		break;
++	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
++		val->intval = prop_values.voltage_now;
++		break;
++	case POWER_SUPPLY_PROP_VOLTAGE_AVG:
++		val->intval = prop_values.voltage_avg;
++		break;
++	case POWER_SUPPLY_PROP_VOLTAGE_BOOT:
++		val->intval = prop_values.voltage_boot;
++		break;
++	case POWER_SUPPLY_PROP_CAPACITY:
++		val->intval = prop_values.capacity;
++		break;
++	case POWER_SUPPLY_PROP_SCOPE:
++		val->intval = POWER_SUPPLY_SCOPE_DEVICE;
++		break;
++	case POWER_SUPPLY_PROP_TEMP:
++		val->intval = prop_values.temp;
++		break;
++	case POWER_SUPPLY_PROP_TEMP_MIN:
++		val->intval = 0; /* 0 C */
++		break;
++	case POWER_SUPPLY_PROP_TEMP_MAX:
++		val->intval = 400; /* 40 C */
++		break;
++	case POWER_SUPPLY_PROP_TEMP_ALERT_MIN:
++		val->intval = 15; /* 1.5 C */
++		break;
++	case POWER_SUPPLY_PROP_TEMP_ALERT_MAX:
++		val->intval = 380; /* 38 C */
++		break;
++	default:
++		ret = -EINVAL;
++		break;
++	}
++
++	return ret;
++}
++
++static inline void thunderstrike_request_psy_stats(struct thunderstrike *ts)
++{
++	set_bit(THUNDERSTRIKE_POWER_SUPPLY_STATS_UPDATE, &ts->update_flags);
++	schedule_work(&ts->hostcmd_req_work);
++}
++
++static void thunderstrike_psy_stats_timer_handler(struct timer_list *timer)
++{
++	struct thunderstrike *ts =
++		container_of(timer, struct thunderstrike, psy_stats_timer);
++
++	thunderstrike_request_psy_stats(ts);
++	/* Query battery statistics from device every five minutes */
++	mod_timer(timer, jiffies + 300 * HZ);
++}
++
 +static void
 +thunderstrike_parse_fw_version_payload(struct shield_device *shield_dev,
 +				       __le16 fw_version)
@@ -426,13 +590,156 @@ index 00000000000000..b29af579868fd8
 +		haptics->motor_left, haptics->motor_right);
 +}
 +
++static void
++thunderstrike_parse_led_payload(struct shield_device *shield_dev,
++				enum thunderstrike_led_state led_state)
++{
++	struct thunderstrike *ts = container_of(shield_dev, struct thunderstrike, base);
++
++	switch (led_state) {
++	case THUNDERSTRIKE_LED_OFF:
++		ts->led_state = 0;
++		break;
++	case THUNDERSTRIKE_LED_ON:
++		ts->led_state = 1;
++		break;
++	}
++
++	hid_dbg(shield_dev->hdev, "Thunderstrike led HOSTCMD response, 0x%02X\n", led_state);
++}
++
++static void thunderstrike_parse_battery_payload(
++	struct shield_device *shield_dev,
++	struct thunderstrike_hostcmd_battery *battery)
++{
++	struct thunderstrike *ts = container_of(shield_dev, struct thunderstrike, base);
++	u16 hostcmd_voltage_boot = le16_to_cpu(battery->voltage_boot);
++	u16 hostcmd_voltage_avg = le16_to_cpu(battery->voltage_avg);
++	u16 hostcmd_voltage_min = le16_to_cpu(battery->voltage_min);
++	u16 hostcmd_voltage_now = le16_to_cpu(battery->voltage_now);
++	u16 hostcmd_thermistor = le16_to_cpu(battery->thermistor);
++	int voltage_boot, voltage_avg, voltage_min, voltage_now;
++	struct hid_device *hdev = shield_dev->hdev;
++	u8 capacity = battery->capacity;
++	int temp;
++
++	/* Convert thunderstrike device values to µV and tenths of degree Celsius */
++	voltage_boot = hostcmd_voltage_boot * 1000;
++	voltage_avg = hostcmd_voltage_avg * 1000;
++	voltage_min = hostcmd_voltage_min * 1000;
++	voltage_now = hostcmd_voltage_now * 1000;
++	temp = (1378 - (int)hostcmd_thermistor) * 10 / 19;
++
++	/* Copy converted values */
++	spin_lock(&ts->psy_stats_lock);
++	ts->psy_stats.voltage_boot = voltage_boot;
++	ts->psy_stats.voltage_avg = voltage_avg;
++	ts->psy_stats.voltage_min = voltage_min;
++	ts->psy_stats.voltage_now = voltage_now;
++	ts->psy_stats.capacity = capacity;
++	ts->psy_stats.temp = temp;
++	spin_unlock(&ts->psy_stats_lock);
++
++	set_bit(SHIELD_BATTERY_STATS_INITIALIZED, &shield_dev->initialized_flags);
++
++	hid_dbg(hdev,
++		"Thunderstrike battery HOSTCMD response, voltage_avg: %u voltage_now: %u\n",
++		hostcmd_voltage_avg, hostcmd_voltage_now);
++	hid_dbg(hdev,
++		"Thunderstrike battery HOSTCMD response, voltage_boot: %u voltage_min: %u\n",
++		hostcmd_voltage_boot, hostcmd_voltage_min);
++	hid_dbg(hdev,
++		"Thunderstrike battery HOSTCMD response, thermistor: %u\n",
++		hostcmd_thermistor);
++	hid_dbg(hdev,
++		"Thunderstrike battery HOSTCMD response, capacity: %u%%\n",
++		capacity);
++}
++
++static void thunderstrike_parse_charger_payload(
++	struct shield_device *shield_dev,
++	struct thunderstrike_hostcmd_charger *charger)
++{
++	struct thunderstrike *ts = container_of(shield_dev, struct thunderstrike, base);
++	int charge_type = POWER_SUPPLY_CHARGE_TYPE_UNKNOWN;
++	struct hid_device *hdev = shield_dev->hdev;
++	int status = POWER_SUPPLY_STATUS_UNKNOWN;
++
++	switch (charger->type) {
++	case THUNDERSTRIKE_CHARGER_TYPE_NONE:
++		charge_type = POWER_SUPPLY_CHARGE_TYPE_NONE;
++		break;
++	case THUNDERSTRIKE_CHARGER_TYPE_TRICKLE:
++		charge_type = POWER_SUPPLY_CHARGE_TYPE_TRICKLE;
++		break;
++	case THUNDERSTRIKE_CHARGER_TYPE_NORMAL:
++		charge_type = POWER_SUPPLY_CHARGE_TYPE_STANDARD;
++		break;
++	default:
++		hid_warn(hdev, "Unhandled Thunderstrike charger HOSTCMD type, %u\n",
++			 charger->type);
++		break;
++	}
++
++	switch (charger->state) {
++	case THUNDERSTRIKE_CHARGER_STATE_UNKNOWN:
++		status = POWER_SUPPLY_STATUS_UNKNOWN;
++		break;
++	case THUNDERSTRIKE_CHARGER_STATE_DISABLED:
++		/* Indicates charger is disconnected */
++		break;
++	case THUNDERSTRIKE_CHARGER_STATE_CHARGING:
++		status = POWER_SUPPLY_STATUS_CHARGING;
++		break;
++	case THUNDERSTRIKE_CHARGER_STATE_FULL:
++		status = POWER_SUPPLY_STATUS_FULL;
++		break;
++	case THUNDERSTRIKE_CHARGER_STATE_FAILED:
++		status = POWER_SUPPLY_STATUS_NOT_CHARGING;
++		hid_err(hdev, "Thunderstrike device failed to charge\n");
++		break;
++	default:
++		hid_warn(hdev, "Unhandled Thunderstrike charger HOSTCMD state, %u\n",
++			 charger->state);
++		break;
++	}
++
++	if (!charger->connected)
++		status = POWER_SUPPLY_STATUS_DISCHARGING;
++
++	spin_lock(&ts->psy_stats_lock);
++	ts->psy_stats.charge_type = charge_type;
++	ts->psy_stats.status = status;
++	spin_unlock(&ts->psy_stats_lock);
++
++	set_bit(SHIELD_CHARGER_STATE_INITIALIZED, &shield_dev->initialized_flags);
++
++	hid_dbg(hdev,
++		"Thunderstrike charger HOSTCMD response, connected: %u, type: %u, state: %u\n",
++		charger->connected, charger->type, charger->state);
++}
++
++static inline void thunderstrike_device_init_info(struct shield_device *shield_dev)
++{
++	struct thunderstrike *ts =
++		container_of(shield_dev, struct thunderstrike, base);
++
++	if (!test_bit(SHIELD_FW_VERSION_INITIALIZED, &shield_dev->initialized_flags))
++		thunderstrike_request_firmware_version(ts);
++
++	if (!test_bit(SHIELD_BOARD_INFO_INITIALIZED, &shield_dev->initialized_flags))
++		thunderstrike_request_board_info(ts);
++
++	if (!test_bit(SHIELD_BATTERY_STATS_INITIALIZED, &shield_dev->initialized_flags) ||
++	    !test_bit(SHIELD_CHARGER_STATE_INITIALIZED, &shield_dev->initialized_flags))
++		thunderstrike_psy_stats_timer_handler(&ts->psy_stats_timer);
++}
++
 +static int thunderstrike_parse_report(struct shield_device *shield_dev,
 +				      struct hid_report *report, u8 *data,
 +				      int size)
 +{
 +	struct thunderstrike_hostcmd_resp_report *hostcmd_resp_report;
-+	struct thunderstrike *ts =
-+		container_of(shield_dev, struct thunderstrike, base);
 +	struct hid_device *hdev = shield_dev->hdev;
 +
 +	switch (report->id) {
@@ -452,6 +759,13 @@ index 00000000000000..b29af579868fd8
 +			thunderstrike_parse_fw_version_payload(
 +				shield_dev, hostcmd_resp_report->fw_version);
 +			break;
++		case THUNDERSTRIKE_HOSTCMD_ID_LED:
++			thunderstrike_parse_led_payload(shield_dev, hostcmd_resp_report->led_state);
++			break;
++		case THUNDERSTRIKE_HOSTCMD_ID_BATTERY:
++			thunderstrike_parse_battery_payload(shield_dev,
++							    &hostcmd_resp_report->battery);
++			break;
 +		case THUNDERSTRIKE_HOSTCMD_ID_BOARD_INFO:
 +			thunderstrike_parse_board_info_payload(
 +				shield_dev, &hostcmd_resp_report->board_info);
@@ -460,14 +774,17 @@ index 00000000000000..b29af579868fd8
 +			thunderstrike_parse_haptics_payload(
 +				shield_dev, &hostcmd_resp_report->motors);
 +			break;
-+
 +		case THUNDERSTRIKE_HOSTCMD_ID_USB_INIT:
-+		case THUNDERSTRIKE_HOSTCMD_ID_BLUETOOTH_INIT:
 +			/* May block HOSTCMD requests till received initially */
-+			thunderstrike_request_firmware_version(ts);
-+			thunderstrike_request_board_info(ts);
-+			/* Only HOSTCMD that can be triggered without a request */
-+			return 0;
++			thunderstrike_device_init_info(shield_dev);
++			break;
++		case THUNDERSTRIKE_HOSTCMD_ID_CHARGER:
++			/* May block HOSTCMD requests till received initially */
++			thunderstrike_device_init_info(shield_dev);
++
++			thunderstrike_parse_charger_payload(
++				shield_dev, &hostcmd_resp_report->charger);
++			break;
 +		default:
 +			hid_warn(hdev,
 +				 "Unhandled Thunderstrike HOSTCMD id %d\n",
@@ -483,10 +800,69 @@ index 00000000000000..b29af579868fd8
 +	return 0;
 +}
 +
++static inline int thunderstrike_led_create(struct thunderstrike *ts)
++{
++	struct led_classdev *led = &ts->led_dev;
++
++	led->name = devm_kasprintf(&ts->base.hdev->dev, GFP_KERNEL,
++				   "thunderstrike%d:blue:led", ts->id);
++	led->max_brightness = 1;
++	led->flags = LED_CORE_SUSPENDRESUME | LED_RETAIN_AT_SHUTDOWN;
++	led->brightness_get = &thunderstrike_led_get_brightness;
++	led->brightness_set = &thunderstrike_led_set_brightness;
++
++	return led_classdev_register(&ts->base.hdev->dev, led);
++}
++
++static inline int thunderstrike_psy_create(struct shield_device *shield_dev)
++{
++	struct thunderstrike *ts = container_of(shield_dev, struct thunderstrike, base);
++	struct power_supply_config psy_cfg = { .drv_data = shield_dev, };
++	struct hid_device *hdev = shield_dev->hdev;
++	int ret;
++
++	/*
++	 * Set an initial capacity and temperature value to avoid prematurely
++	 * triggering alerts. Will be replaced by values queried from initial
++	 * HOSTCMD requests.
++	 */
++	ts->psy_stats.capacity = 100;
++	ts->psy_stats.temp = 182;
++
++	shield_dev->battery_dev.desc.properties = thunderstrike_battery_props;
++	shield_dev->battery_dev.desc.num_properties =
++		ARRAY_SIZE(thunderstrike_battery_props);
++	shield_dev->battery_dev.desc.get_property = thunderstrike_battery_get_property;
++	shield_dev->battery_dev.desc.type = POWER_SUPPLY_TYPE_BATTERY;
++	shield_dev->battery_dev.desc.name =
++		devm_kasprintf(&ts->base.hdev->dev, GFP_KERNEL,
++			       "thunderstrike_%d", ts->id);
++
++	shield_dev->battery_dev.psy = power_supply_register(
++		&hdev->dev, &shield_dev->battery_dev.desc, &psy_cfg);
++	if (IS_ERR(shield_dev->battery_dev.psy)) {
++		hid_err(hdev, "Failed to register Thunderstrike battery device\n");
++		return PTR_ERR(shield_dev->battery_dev.psy);
++	}
++
++	ret = power_supply_powers(shield_dev->battery_dev.psy, &hdev->dev);
++	if (ret) {
++		hid_err(hdev, "Failed to associate battery device to Thunderstrike\n");
++		goto err;
++	}
++
++	return 0;
++
++err:
++	power_supply_unregister(shield_dev->battery_dev.psy);
++	return ret;
++}
++
 +static struct shield_device *thunderstrike_create(struct hid_device *hdev)
 +{
 +	struct shield_device *shield_dev;
 +	struct thunderstrike *ts;
++	int ret;
 +
 +	ts = devm_kzalloc(&hdev->dev, sizeof(*ts), GFP_KERNEL);
 +	if (!ts)
@@ -502,16 +878,90 @@ index 00000000000000..b29af579868fd8
 +	shield_dev->codename = "Thunderstrike";
 +
 +	spin_lock_init(&ts->haptics_update_lock);
++	spin_lock_init(&ts->psy_stats_lock);
 +	INIT_WORK(&ts->hostcmd_req_work, thunderstrike_hostcmd_req_work_handler);
 +
 +	hid_set_drvdata(hdev, shield_dev);
 +
++	ts->id = ida_alloc(&thunderstrike_ida, GFP_KERNEL);
++	if (ts->id < 0)
++		return ERR_PTR(ts->id);
++
 +	ts->haptics_dev = shield_haptics_create(shield_dev, thunderstrike_play_effect);
-+	if (IS_ERR(ts->haptics_dev))
-+		return ERR_CAST(ts->haptics_dev);
++	if (IS_ERR(ts->haptics_dev)) {
++		hid_err(hdev, "Failed to create Thunderstrike haptics instance\n");
++		ret = PTR_ERR(ts->haptics_dev);
++		goto err_id;
++	}
++
++	ret = thunderstrike_psy_create(shield_dev);
++	if (ret) {
++		hid_err(hdev, "Failed to create Thunderstrike power supply instance\n");
++		goto err_haptics;
++	}
++
++	ret = thunderstrike_led_create(ts);
++	if (ret) {
++		hid_err(hdev, "Failed to create Thunderstrike LED instance\n");
++		goto err_psy;
++	}
++
++	timer_setup(&ts->psy_stats_timer, thunderstrike_psy_stats_timer_handler, 0);
 +
 +	hid_info(hdev, "Registered Thunderstrike controller\n");
 +	return shield_dev;
++
++err_psy:
++	power_supply_unregister(shield_dev->battery_dev.psy);
++err_haptics:
++	if (ts->haptics_dev)
++		input_unregister_device(ts->haptics_dev);
++err_id:
++	ida_free(&thunderstrike_ida, ts->id);
++	return ERR_PTR(ret);
++}
++
++static void thunderstrike_destroy(struct thunderstrike *ts)
++{
++	led_classdev_unregister(&ts->led_dev);
++	power_supply_unregister(ts->base.battery_dev.psy);
++	if (ts->haptics_dev)
++		input_unregister_device(ts->haptics_dev);
++	ida_free(&thunderstrike_ida, ts->id);
++}
++
++static int android_input_mapping(struct hid_device *hdev, struct hid_input *hi,
++				 struct hid_field *field,
++				 struct hid_usage *usage, unsigned long **bit,
++				 int *max)
++{
++	if ((usage->hid & HID_USAGE_PAGE) != HID_UP_CONSUMER)
++		return 0;
++
++	switch (usage->hid & HID_USAGE) {
++	case HID_USAGE_ANDROID_PLAYPAUSE_BTN:
++		android_map_key(KEY_PLAYPAUSE);
++		break;
++	case HID_USAGE_ANDROID_VOLUMEUP_BTN:
++		android_map_key(KEY_VOLUMEUP);
++		break;
++	case HID_USAGE_ANDROID_VOLUMEDOWN_BTN:
++		android_map_key(KEY_VOLUMEDOWN);
++		break;
++	case HID_USAGE_ANDROID_SEARCH_BTN:
++		android_map_key(BTN_Z);
++		break;
++	case HID_USAGE_ANDROID_HOME_BTN:
++		android_map_key(BTN_MODE);
++		break;
++	case HID_USAGE_ANDROID_BACK_BTN:
++		android_map_key(BTN_SELECT);
++		break;
++	default:
++		return 0;
++	}
++
++	return 1;
 +}
 +
 +static ssize_t firmware_version_show(struct device *dev,
@@ -623,7 +1073,7 @@ index 00000000000000..b29af579868fd8
 +	ret = hid_hw_start(hdev, HID_CONNECT_HIDINPUT);
 +	if (ret) {
 +		hid_err(hdev, "Failed to start HID device\n");
-+		goto err_haptics;
++		goto err_ts_create;
 +	}
 +
 +	ret = hid_hw_open(hdev);
@@ -632,16 +1082,14 @@ index 00000000000000..b29af579868fd8
 +		goto err_stop;
 +	}
 +
-+	thunderstrike_request_firmware_version(ts);
-+	thunderstrike_request_board_info(ts);
++	thunderstrike_device_init_info(shield_dev);
 +
 +	return ret;
 +
 +err_stop:
 +	hid_hw_stop(hdev);
-+err_haptics:
-+	if (ts->haptics_dev)
-+		input_unregister_device(ts->haptics_dev);
++err_ts_create:
++	thunderstrike_destroy(ts);
 +	return ret;
 +}
 +
@@ -653,8 +1101,8 @@ index 00000000000000..b29af579868fd8
 +	ts = container_of(dev, struct thunderstrike, base);
 +
 +	hid_hw_close(hdev);
-+	if (ts->haptics_dev)
-+		input_unregister_device(ts->haptics_dev);
++	thunderstrike_destroy(ts);
++	del_timer_sync(&ts->psy_stats_timer);
 +	cancel_work_sync(&ts->hostcmd_req_work);
 +	hid_hw_stop(hdev);
 +}
@@ -664,16 +1112,17 @@ index 00000000000000..b29af579868fd8
 +			       USB_DEVICE_ID_NVIDIA_THUNDERSTRIKE_CONTROLLER) },
 +	{ HID_USB_DEVICE(USB_VENDOR_ID_NVIDIA,
 +			 USB_DEVICE_ID_NVIDIA_THUNDERSTRIKE_CONTROLLER) },
-+	{}
++	{ }
 +};
 +MODULE_DEVICE_TABLE(hid, shield_devices);
 +
 +static struct hid_driver shield_driver = {
-+	.name         = "shield",
-+	.id_table     = shield_devices,
-+	.probe        = shield_probe,
-+	.remove       = shield_remove,
-+	.raw_event    = shield_raw_event,
++	.name          = "shield",
++	.id_table      = shield_devices,
++	.input_mapping = android_input_mapping,
++	.probe         = shield_probe,
++	.remove        = shield_remove,
++	.raw_event     = shield_raw_event,
 +	.driver = {
 +		.dev_groups = shield_device_groups,
 +	},
@@ -683,3 +1132,76 @@ index 00000000000000..b29af579868fd8
 +MODULE_AUTHOR("Rahul Rameshbabu <rrameshbabu@nvidia.com>");
 +MODULE_DESCRIPTION("HID Driver for NVIDIA SHIELD peripherals.");
 +MODULE_LICENSE("GPL");
+diff --git a/drivers/hid/Kconfig b/drivers/hid/Kconfig
+index 91bffaa1f80d..56298611e688 100644
+--- a/drivers/hid/Kconfig
++++ b/drivers/hid/Kconfig
+@@ -774,6 +774,26 @@ config HID_NTRIG
+ 	help
+ 	Support for N-Trig touch screen.
+ 
++config HID_NVIDIA_SHIELD
++	tristate "NVIDIA SHIELD devices"
++	depends on USB_HID
++	depends on BT_HIDP
++	depends on LEDS_CLASS
++	select POWER_SUPPLY
++	help
++	  Support for NVIDIA SHIELD accessories.
++
++	  Supported devices:
++	  - Thunderstrike (NVIDIA SHIELD Controller 2017)
++
++config NVIDIA_SHIELD_FF
++	bool "NVIDIA SHIELD force feedback support"
++	depends on HID_NVIDIA_SHIELD
++	select INPUT_FF_MEMLESS
++	help
++	  Say Y here if you would like to enable force feedback support for
++	  NVIDIA SHIELD accessories with haptics capabilities.
++
+ config HID_ORTEK
+ 	tristate "Ortek PKB-1700/WKB-2000/Skycable wireless keyboard and mouse trackpad"
+ 	help
+diff --git a/drivers/hid/Makefile b/drivers/hid/Makefile
+index 9e968c1181e3..5575603726b5 100644
+--- a/drivers/hid/Makefile
++++ b/drivers/hid/Makefile
+@@ -84,6 +84,7 @@ obj-$(CONFIG_HID_MULTITOUCH)	+= hid-multitouch.o
+ obj-$(CONFIG_HID_NINTENDO)	+= hid-nintendo.o
+ obj-$(CONFIG_HID_NTI)			+= hid-nti.o
+ obj-$(CONFIG_HID_NTRIG)		+= hid-ntrig.o
++obj-$(CONFIG_HID_NVIDIA_SHIELD)	+= hid-nvidia-shield.o
+ obj-$(CONFIG_HID_ORTEK)		+= hid-ortek.o
+ obj-$(CONFIG_HID_PRODIKEYS)	+= hid-prodikeys.o
+ obj-$(CONFIG_HID_PANTHERLORD)	+= hid-pl.o
+diff --git a/drivers/hid/hid-ids.h b/drivers/hid/hid-ids.h
+index f07edec74e81..1aae395742a1 100644
+--- a/drivers/hid/hid-ids.h
++++ b/drivers/hid/hid-ids.h
+@@ -994,6 +994,9 @@
+ #define USB_DEVICE_ID_NTRIG_TOUCH_SCREEN_18   0x0014
+ #define USB_DEVICE_ID_NTRIG_DUOSENSE 0x1500
+ 
++#define USB_VENDOR_ID_NVIDIA				0x0955
++#define USB_DEVICE_ID_NVIDIA_THUNDERSTRIKE_CONTROLLER	0x7214
++
+ #define USB_VENDOR_ID_ONTRAK		0x0a07
+ #define USB_DEVICE_ID_ONTRAK_ADU100	0x0064
+ 
+diff --git a/MAINTAINERS b/MAINTAINERS
+index 6d6509846197..2c7a9a2c65f2 100644
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -9145,6 +9145,11 @@ L:	linux-input@vger.kernel.org
+ S:	Maintained
+ F:	drivers/hid/hid-logitech-*
+ 
++HID NVIDIA SHIELD DRIVER
++M:	Rahul Rameshbabu <rrameshbabu@nvidia.com>
++S:	Maintained
++F:	drivers/hid/hid-nvidia-shield.c
++
+ HID PLAYSTATION DRIVER
+ M:	Roderick Colenbrander <roderick.colenbrander@sony.com>
+ L:	linux-input@vger.kernel.org
