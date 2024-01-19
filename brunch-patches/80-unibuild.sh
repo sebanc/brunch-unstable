@@ -28,7 +28,11 @@ elif [ "$board" == "volteer" ]; then
 elif [ "$board" == "zork" ]; then
 	hwid="GUMBOZ-JPUQ"
 elif [ "$board" == "guybrush" ]; then
-	hwid="NIPPERKIN"	
+	hwid="NIPPERKIN"
+elif [ "$board" == "skyrim" ]; then
+	hwid="MARKARTH"
+elif [ "$board" == "brya" ]; then
+	hwid="OMNIGUL"
 else
 	hwid="$(echo $board | tr a-z A-Z)"
 fi
