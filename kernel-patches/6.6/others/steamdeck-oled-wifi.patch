@@ -1,0 +1,762 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "neil.shi" <neil.shi@quectel.com>
+Date: Tue, 23 May 2023 16:58:08 +0800
+Subject: [PATCH] wifi: ath11k: [DBS PATCH 1/6]: Indicate NAN support to
+ firmware
+
+Signed-off-by: neil.shi <neil.shi@quectel.com>
+Signed-off-by: Jan200101 <sentrycraft123@gmail.com>
+---
+ drivers/net/wireless/ath/ath11k/hw.c  |  1 +
+ drivers/net/wireless/ath/ath11k/wmi.c |  1 +
+ drivers/net/wireless/ath/ath11k/wmi.h | 10 ++++++++++
+ 3 files changed, 12 insertions(+)
+
+diff --git a/drivers/net/wireless/ath/ath11k/hw.c b/drivers/net/wireless/ath/ath11k/hw.c
+index d7b5ec6e6904..210759ddf2fb 100644
+--- a/drivers/net/wireless/ath/ath11k/hw.c
++++ b/drivers/net/wireless/ath/ath11k/hw.c
+@@ -100,6 +100,7 @@ static void ath11k_init_wmi_config_qca6390(struct ath11k_base *ab,
+ 	config->num_wow_filters = 0x16;
+ 	config->num_keep_alive_pattern = 0;
+ 	config->flag1 |= WMI_RSRC_CFG_FLAG1_BSS_CHANNEL_INFO_64;
++	config->host_service_flags |= WMI_RSRC_CFG_HOST_SERVICE_FLAG_NAN_IFACE_SUPPORT;
+ }
+ 
+ static void ath11k_hw_ipq8074_reo_setup(struct ath11k_base *ab)
+diff --git a/drivers/net/wireless/ath/ath11k/wmi.c b/drivers/net/wireless/ath/ath11k/wmi.c
+index 2845b4313d3a..e2dcdb3b78cc 100644
+--- a/drivers/net/wireless/ath/ath11k/wmi.c
++++ b/drivers/net/wireless/ath/ath11k/wmi.c
+@@ -4069,6 +4069,7 @@ ath11k_wmi_copy_resource_config(struct wmi_resource_config *wmi_cfg,
+ 	wmi_cfg->sched_params = tg_cfg->sched_params;
+ 	wmi_cfg->twt_ap_pdev_count = tg_cfg->twt_ap_pdev_count;
+ 	wmi_cfg->twt_ap_sta_count = tg_cfg->twt_ap_sta_count;
++	wmi_cfg->host_service_flags = tg_cfg->host_service_flags;
+ 	wmi_cfg->host_service_flags &=
+ 		~(1 << WMI_CFG_HOST_SERVICE_FLAG_REG_CC_EXT);
+ 	wmi_cfg->host_service_flags |= (tg_cfg->is_reg_cc_ext_event_supported <<
+diff --git a/drivers/net/wireless/ath/ath11k/wmi.h b/drivers/net/wireless/ath/ath11k/wmi.h
+index 100bb816b592..a8354022f575 100644
+--- a/drivers/net/wireless/ath/ath11k/wmi.h
++++ b/drivers/net/wireless/ath/ath11k/wmi.h
+@@ -2330,6 +2330,7 @@ struct wmi_init_cmd {
+ #define WMI_RSRC_CFG_FLAG1_BSS_CHANNEL_INFO_64 BIT(5)
+ #define WMI_RSRC_CFG_FLAG2_CALC_NEXT_DTIM_COUNT_SET BIT(9)
+ #define WMI_RSRC_CFG_FLAG1_ACK_RSSI BIT(18)
++#define WMI_RSRC_CFG_HOST_SERVICE_FLAG_NAN_IFACE_SUPPORT       BIT(0)
+ 
+ #define WMI_CFG_HOST_SERVICE_FLAG_REG_CC_EXT 4
+ 
+@@ -5700,6 +5701,15 @@ struct target_resource_config {
+ 	u8 is_reg_cc_ext_event_supported;
+ 	u32 ema_max_vap_cnt;
+ 	u32 ema_max_profile_period;
++	u32 max_nlo_ssids;
++	u32 num_packet_filters;
++	u32 num_max_sta_vdevs;
++	u32 max_bssid_indicator;
++	u32 ul_resp_config;
++	u32 msdu_flow_override_config0;
++	u32 msdu_flow_override_config1;
++	u32 flags2;
++	u32 host_service_flags;
+ };
+ 
+ enum wmi_debug_log_param {
+
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "neil.shi" <neil.shi@quectel.com>
+Date: Tue, 23 May 2023 17:01:06 +0800
+Subject: [PATCH] wifi: ath11k: [DBS PATCH 2/6] wifi: ath11k: add support for
+ QCA206X
+
+Signed-off-by: Jan200101 <sentrycraft123@gmail.com>
+---
+ drivers/net/wireless/ath/ath11k/core.c | 64 ++++++++++++++++++++++++++
+ drivers/net/wireless/ath/ath11k/core.h |  1 +
+ drivers/net/wireless/ath/ath11k/mhi.c  |  1 +
+ drivers/net/wireless/ath/ath11k/pci.c  | 17 ++++++-
+ 4 files changed, 82 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/net/wireless/ath/ath11k/core.c b/drivers/net/wireless/ath/ath11k/core.c
+index 0c6ecbb9a066..766cf2db5b45 100644
+--- a/drivers/net/wireless/ath/ath11k/core.c
++++ b/drivers/net/wireless/ath/ath11k/core.c
+@@ -411,6 +411,70 @@ static const struct ath11k_hw_params ath11k_hw_params[] = {
+ 			.fragment_160mhz = false,
+ 		},
+ 
++		.interface_modes = BIT(NL80211_IFTYPE_STATION) |
++					BIT(NL80211_IFTYPE_AP),
++		.supports_monitor = false,
++		.supports_shadow_regs = true,
++		.idle_ps = true,
++		.supports_sta_ps = true,
++		.cold_boot_calib = false,
++		.fw_mem_mode = 0,
++		.num_vdevs = 16 + 1,
++		.num_peers = 512,
++		.supports_suspend = true,
++		.hal_desc_sz = sizeof(struct hal_rx_desc_wcn6855),
++		.supports_regdb = true,
++		.fix_l1ss = false,
++		.credit_flow = true,
++		.max_tx_ring = DP_TCL_NUM_RING_MAX_QCA6390,
++		.hal_params = &ath11k_hw_hal_params_qca6390,
++		.supports_dynamic_smps_6ghz = false,
++		.alloc_cacheable_memory = false,
++		.wakeup_mhi = true,
++		.supports_rssi_stats = true,
++		.fw_wmi_diag_event = true,
++		.current_cc_support = true,
++		.dbr_debug_support = false,
++	},
++	{
++		.name = "qca206x hw2.1",
++		.hw_rev = ATH11K_HW_QCA206X_HW21,
++		.fw = {
++			.dir = "QCA206X/hw2.1",
++			.board_size = 256 * 1024,
++			.cal_offset = 128 * 1024,
++		},
++		.max_radios = 3,
++		.bdf_addr = 0x4B0C0000,
++		.hw_ops = &wcn6855_ops,
++		.ring_mask = &ath11k_hw_ring_mask_qca6390,
++		.internal_sleep_clock = true,
++		.regs = &wcn6855_regs,
++		.qmi_service_ins_id = ATH11K_QMI_WLFW_SERVICE_INS_ID_V01_QCA6390,
++		.host_ce_config = ath11k_host_ce_config_qca6390,
++		.ce_count = 9,
++		.target_ce_config = ath11k_target_ce_config_wlan_qca6390,
++		.target_ce_count = 9,
++		.svc_to_ce_map = ath11k_target_service_to_ce_map_wlan_qca6390,
++		.svc_to_ce_map_len = 14,
++		.rfkill_pin = 0,
++		.rfkill_cfg = 0,
++		.rfkill_on_level = 0,
++		.single_pdev_only = true,
++		.rxdma1_enable = false,
++		.num_rxmda_per_pdev = 2,
++		.rx_mac_buf_ring = true,
++		.vdev_start_delay = true,
++		.htt_peer_map_v2 = false,
++
++		.spectral = {
++			.fft_sz = 0,
++			.fft_pad_sz = 0,
++			.summary_pad_sz = 0,
++			.fft_hdr_len = 0,
++			.max_fft_bins = 0,
++		},
++
+ 		.interface_modes = BIT(NL80211_IFTYPE_STATION) |
+ 					BIT(NL80211_IFTYPE_AP),
+ 		.supports_monitor = false,
+diff --git a/drivers/net/wireless/ath/ath11k/core.h b/drivers/net/wireless/ath/ath11k/core.h
+index 667d55e26156..0c0960994231 100644
+--- a/drivers/net/wireless/ath/ath11k/core.h
++++ b/drivers/net/wireless/ath/ath11k/core.h
+@@ -147,6 +147,7 @@ enum ath11k_hw_rev {
+ 	ATH11K_HW_WCN6855_HW21,
+ 	ATH11K_HW_WCN6750_HW10,
+ 	ATH11K_HW_IPQ5018_HW10,
++	ATH11K_HW_QCA206X_HW21,
+ };
+ 
+ enum ath11k_firmware_mode {
+diff --git a/drivers/net/wireless/ath/ath11k/mhi.c b/drivers/net/wireless/ath/ath11k/mhi.c
+index afeabd6ecc67..92917d842d57 100644
+--- a/drivers/net/wireless/ath/ath11k/mhi.c
++++ b/drivers/net/wireless/ath/ath11k/mhi.c
+@@ -443,6 +443,7 @@ int ath11k_mhi_register(struct ath11k_pci *ab_pci)
+ 	case ATH11K_HW_QCA6390_HW20:
+ 	case ATH11K_HW_WCN6855_HW20:
+ 	case ATH11K_HW_WCN6855_HW21:
++	case ATH11K_HW_QCA206X_HW21:
+ 		ath11k_mhi_config = &ath11k_mhi_config_qca6390;
+ 		break;
+ 	default:
+diff --git a/drivers/net/wireless/ath/ath11k/pci.c b/drivers/net/wireless/ath/ath11k/pci.c
+index 09e65c5e55c4..2fa4a99e7b08 100644
+--- a/drivers/net/wireless/ath/ath11k/pci.c
++++ b/drivers/net/wireless/ath/ath11k/pci.c
+@@ -28,6 +28,8 @@
+ #define QCN9074_DEVICE_ID		0x1104
+ #define WCN6855_DEVICE_ID		0x1103
+ 
++#define SUB_VERSION	0x1910010
++
+ static const struct pci_device_id ath11k_pci_id_table[] = {
+ 	{ PCI_VDEVICE(QCOM, QCA6390_DEVICE_ID) },
+ 	{ PCI_VDEVICE(QCOM, WCN6855_DEVICE_ID) },
+@@ -809,7 +811,19 @@ static int ath11k_pci_probe(struct pci_dev *pdev,
+ 				break;
+ 			case 0x10:
+ 			case 0x11:
+-				ab->hw_rev = ATH11K_HW_WCN6855_HW21;
++				//ab->hw_rev = ATH11K_HW_WCN6855_HW21;
++				sub_version = ath11k_pci_read32(ab, SUB_VERSION);
++				ath11k_dbg(ab, ATH11K_DBG_PCI, "sub_version 0x%x\n", sub_version);
++				switch (sub_version) {
++				case 0x1019A0E1:
++				case 0x1019B0E1:
++				case 0x1019C0E1:
++				case 0x1019D0E1:
++					ab->hw_rev = ATH11K_HW_QCA206X_HW21;
++					break;
++				default:
++					ab->hw_rev = ATH11K_HW_WCN6855_HW21;
++				}
+ 				break;
+ 			default:
+ 				goto unsupported_wcn6855_soc;
+@@ -1021,6 +1035,7 @@ static struct pci_driver ath11k_pci_driver = {
+ static int ath11k_pci_init(void)
+ {
+ 	int ret;
++	u32 sub_version;
+ 
+ 	ret = pci_register_driver(&ath11k_pci_driver);
+ 	if (ret)
+
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "neil.shi" <neil.shi@quectel.com>
+Date: Tue, 23 May 2023 17:04:27 +0800
+Subject: [PATCH] wifi: ath11k: [DBS PATCH 3/6]: support 2 stations and report
+ addresses
+
+Report 2 station interfaces if chip has more than 1
+num_rxmda_per_pdev in hw_params, and report addresses
+for these interfaces.
+
+Signed-off-by: neil.shi <neil.shi@quectel.com>
+Signed-off-by: Jan200101 <sentrycraft123@gmail.com>
+---
+ drivers/net/wireless/ath/ath11k/mac.c | 83 ++++++++++++++++++++-------
+ 1 file changed, 63 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath11k/mac.c b/drivers/net/wireless/ath/ath11k/mac.c
+index 71c6dab1aedb..967dbe3cfe94 100644
+--- a/drivers/net/wireless/ath/ath11k/mac.c
++++ b/drivers/net/wireless/ath/ath11k/mac.c
+@@ -9284,6 +9284,31 @@ static int ath11k_mac_setup_channels_rates(struct ath11k *ar,
+ 	return 0;
+ }
+ 
++static void ath11k_mac_setup_mac_address_list(struct ath11k *ar)
++{
++	struct mac_address *addresses;
++	u16 n_addresses;
++	int i;
++
++	if (!ar->ab->hw_params.single_pdev_only || ar->ab->hw_params.num_rxmda_per_pdev < 2)
++		return;
++
++	n_addresses = 3;
++	addresses = kcalloc(n_addresses, sizeof(*addresses), GFP_KERNEL);
++	if (!addresses)
++		return;
++
++	memcpy(addresses[0].addr, ar->mac_addr, ETH_ALEN);
++	for (i = 1; i < n_addresses; i++) {
++		memcpy(addresses[i].addr, ar->mac_addr, ETH_ALEN);
++		addresses[i].addr[0] |= 0x2;
++		addresses[i].addr[0] += (i - 1) << 4;
++	}
++
++	ar->hw->wiphy->addresses = addresses;
++	ar->hw->wiphy->n_addresses = n_addresses;
++}
++
+ static int ath11k_mac_setup_iface_combinations(struct ath11k *ar)
+ {
+ 	struct ath11k_base *ab = ar->ab;
+@@ -9303,28 +9328,43 @@ static int ath11k_mac_setup_iface_combinations(struct ath11k *ar)
+ 		return -ENOMEM;
+ 	}
+ 
+-	limits[0].max = 1;
+-	limits[0].types |= BIT(NL80211_IFTYPE_STATION);
+-
+-	limits[1].max = 16;
+-	limits[1].types |= BIT(NL80211_IFTYPE_AP);
++	if (ab->hw_params.single_pdev_only && ar->ab->hw_params.num_rxmda_per_pdev > 1) {
++		limits[0].max = 2;
++		limits[0].types |= BIT(NL80211_IFTYPE_STATION);
+ 
+-	if (IS_ENABLED(CONFIG_MAC80211_MESH) &&
+-	    ab->hw_params.interface_modes & BIT(NL80211_IFTYPE_MESH_POINT))
+-		limits[1].types |= BIT(NL80211_IFTYPE_MESH_POINT);
++		limits[1].max = 1;
++		limits[1].types |= BIT(NL80211_IFTYPE_AP);
+ 
+-	combinations[0].limits = limits;
+-	combinations[0].n_limits = n_limits;
+-	combinations[0].max_interfaces = 16;
+-	combinations[0].num_different_channels = 1;
+-	combinations[0].beacon_int_infra_match = true;
+-	combinations[0].beacon_int_min_gcd = 100;
+-	combinations[0].radar_detect_widths = BIT(NL80211_CHAN_WIDTH_20_NOHT) |
+-						BIT(NL80211_CHAN_WIDTH_20) |
+-						BIT(NL80211_CHAN_WIDTH_40) |
+-						BIT(NL80211_CHAN_WIDTH_80) |
+-						BIT(NL80211_CHAN_WIDTH_80P80) |
+-						BIT(NL80211_CHAN_WIDTH_160);
++		combinations[0].limits = limits;
++		combinations[0].n_limits = 2;
++		combinations[0].max_interfaces = 3;
++		combinations[0].num_different_channels = 2;
++		combinations[0].beacon_int_infra_match = true;
++		combinations[0].beacon_int_min_gcd = 100;
++	} else {
++		limits[0].max = 1;
++		limits[0].types |= BIT(NL80211_IFTYPE_STATION);
++
++		limits[1].max = 16;
++		limits[1].types |= BIT(NL80211_IFTYPE_AP);
++
++		if (IS_ENABLED(CONFIG_MAC80211_MESH) &&
++		    ab->hw_params.interface_modes & BIT(NL80211_IFTYPE_MESH_POINT))
++			limits[1].types |= BIT(NL80211_IFTYPE_MESH_POINT);
++
++		combinations[0].limits = limits;
++		combinations[0].n_limits = 2;
++		combinations[0].max_interfaces = 16;
++		combinations[0].num_different_channels = 1;
++		combinations[0].beacon_int_infra_match = true;
++		combinations[0].beacon_int_min_gcd = 100;
++		combinations[0].radar_detect_widths = BIT(NL80211_CHAN_WIDTH_20_NOHT) |
++							BIT(NL80211_CHAN_WIDTH_20) |
++							BIT(NL80211_CHAN_WIDTH_40) |
++							BIT(NL80211_CHAN_WIDTH_80) |
++							BIT(NL80211_CHAN_WIDTH_80P80) |
++							BIT(NL80211_CHAN_WIDTH_160);
++	}
+ 
+ 	ar->hw->wiphy->iface_combinations = combinations;
+ 	ar->hw->wiphy->n_iface_combinations = 1;
+@@ -9389,6 +9429,8 @@ static void __ath11k_mac_unregister(struct ath11k *ar)
+ 	kfree(ar->hw->wiphy->iface_combinations[0].limits);
+ 	kfree(ar->hw->wiphy->iface_combinations);
+ 
++	kfree(ar->hw->wiphy->addresses);
++
+ 	SET_IEEE80211_DEV(ar->hw, NULL);
+ }
+ 
+@@ -9431,6 +9473,7 @@ static int __ath11k_mac_register(struct ath11k *ar)
+ 	ath11k_pdev_caps_update(ar);
+ 
+ 	SET_IEEE80211_PERM_ADDR(ar->hw, ar->mac_addr);
++	ath11k_mac_setup_mac_address_list(ar);
+ 
+ 	SET_IEEE80211_DEV(ar->hw, ab->dev);
+ 
+
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "neil.shi" <neil.shi@quectel.com>
+Date: Tue, 23 May 2023 17:07:21 +0800
+Subject: [PATCH] wifi: ath11k: [DBS PATCH 6/6]: send coex config to firmware
+ for QCA206X
+
+Signed-off-by: neil.shi <neil.shi@quectel.com>
+Signed-off-by: Jan200101 <sentrycraft123@gmail.com>
+---
+ drivers/net/wireless/ath/ath11k/core.c | 26 +++++++++
+ drivers/net/wireless/ath/ath11k/hw.h   |  1 +
+ drivers/net/wireless/ath/ath11k/wmi.c  | 26 +++++++++
+ drivers/net/wireless/ath/ath11k/wmi.h  | 77 ++++++++++++++++++++++++++
+ 4 files changed, 130 insertions(+)
+
+diff --git a/drivers/net/wireless/ath/ath11k/core.c b/drivers/net/wireless/ath/ath11k/core.c
+index 766cf2db5b45..e3c55b1e792e 100644
+--- a/drivers/net/wireless/ath/ath11k/core.c
++++ b/drivers/net/wireless/ath/ath11k/core.c
+@@ -122,6 +122,7 @@ static const struct ath11k_hw_params ath11k_hw_params[] = {
+ 		.tcl_ring_retry = true,
+ 		.tx_ring_size = DP_TCL_DATA_RING_SIZE,
+ 		.smp2p_wow_exit = false,
++		.coex_isolation = false,
+ 	},
+ 	{
+ 		.hw_rev = ATH11K_HW_IPQ6018_HW10,
+@@ -205,6 +206,7 @@ static const struct ath11k_hw_params ath11k_hw_params[] = {
+ 		.tx_ring_size = DP_TCL_DATA_RING_SIZE,
+ 		.smp2p_wow_exit = false,
+ 		.support_fw_mac_sequence = false,
++		.coex_isolation = false,
+ 	},
+ 	{
+ 		.name = "qca6390 hw2.0",
+@@ -372,6 +374,7 @@ static const struct ath11k_hw_params ath11k_hw_params[] = {
+ 		.tx_ring_size = DP_TCL_DATA_RING_SIZE,
+ 		.smp2p_wow_exit = false,
+ 		.support_fw_mac_sequence = false,
++		.coex_isolation = false,
+ 	},
+ 	{
+ 		.name = "wcn6855 hw2.0",
+@@ -435,6 +438,7 @@ static const struct ath11k_hw_params ath11k_hw_params[] = {
+ 		.fw_wmi_diag_event = true,
+ 		.current_cc_support = true,
+ 		.dbr_debug_support = false,
++		.coex_isolation = false,
+ 	},
+ 	{
+ 		.name = "qca206x hw2.1",
+@@ -521,6 +525,7 @@ static const struct ath11k_hw_params ath11k_hw_params[] = {
+ 		.tx_ring_size = DP_TCL_DATA_RING_SIZE,
+ 		.smp2p_wow_exit = false,
+ 		.support_fw_mac_sequence = true,
++		.coex_isolation = false,
+ 	},
+ 	{
+ 		.name = "wcn6855 hw2.1",
+@@ -1637,6 +1642,18 @@ static void ath11k_core_pdev_destroy(struct ath11k_base *ab)
+ 	ath11k_debugfs_pdev_destroy(ab);
+ }
+ 
++static int ath11k_core_config_coex_isolation(struct ath11k_base *ab)
++{
++       struct ath11k *ar = ath11k_ab_to_ar(ab, 0);
++       struct wmi_coex_config_params param;
++
++       memset(&param, 0, sizeof(struct wmi_coex_config_params));
++       param.config_type = WMI_COEX_CONFIG_ANTENNA_ISOLATION;
++       param.config_arg1 = WMI_COEX_ISOLATION_ARG1_DEFAUT;
++
++       return ath11k_wmi_send_coex_config(ar, &param);
++}
++
+ static int ath11k_core_start(struct ath11k_base *ab)
+ {
+ 	int ret;
+@@ -1734,6 +1751,15 @@ static int ath11k_core_start(struct ath11k_base *ab)
+ 		goto err_reo_cleanup;
+ 	}
+ 
++	if (ab->hw_params.coex_isolation) {
++		ret = ath11k_core_config_coex_isolation(ab);
++		if (ret) {
++			ath11k_err(ab, "failed to set coex isolation: %d\n",
++					ret);
++			goto err_reo_cleanup;
++		}
++	}
++
+ 	return 0;
+ 
+ err_reo_cleanup:
+diff --git a/drivers/net/wireless/ath/ath11k/hw.h b/drivers/net/wireless/ath/ath11k/hw.h
+index d51a99669dd6..9b96ce7f6538 100644
+--- a/drivers/net/wireless/ath/ath11k/hw.h
++++ b/drivers/net/wireless/ath/ath11k/hw.h
+@@ -206,6 +206,7 @@ struct ath11k_hw_params {
+ 	bool fw_wmi_diag_event;
+ 	bool current_cc_support;
+ 	bool dbr_debug_support;
++	bool coex_isolation;
+ 	bool global_reset;
+ 	const struct cfg80211_sar_capa *bios_sar_capa;
+ 	bool m3_fw_support;
+diff --git a/drivers/net/wireless/ath/ath11k/wmi.c b/drivers/net/wireless/ath/ath11k/wmi.c
+index e2dcdb3b78cc..cf292442fab4 100644
+--- a/drivers/net/wireless/ath/ath11k/wmi.c
++++ b/drivers/net/wireless/ath/ath11k/wmi.c
+@@ -8880,6 +8880,32 @@ ath11k_wmi_send_unit_test_cmd(struct ath11k *ar,
+ 	return ret;
+ }
+ 
++int ath11k_wmi_send_coex_config(struct ath11k *ar,
++				struct wmi_coex_config_params *param)
++{
++	struct ath11k_pdev_wmi *wmi = ar->wmi;
++	struct wmi_coex_config_cmd *cmd;
++	struct sk_buff *skb;
++
++	skb = ath11k_wmi_alloc_skb(wmi->wmi_ab, sizeof(*cmd));
++	if (!skb)
++		return -ENOMEM;
++
++	cmd = (struct wmi_coex_config_cmd *)skb->data;
++	cmd->tlv_header = FIELD_PREP(WMI_TLV_TAG, WMI_TAG_COEX_CONFIG_CMD) |
++			  FIELD_PREP(WMI_TLV_LEN, sizeof(*cmd) - TLV_HDR_SIZE);
++	cmd->vdev_id = param->vdev_id;
++	cmd->config_type = param->config_type;
++	cmd->config_arg1 = param->config_arg1;
++	cmd->config_arg2 = param->config_arg2;
++	cmd->config_arg3 = param->config_arg3;
++	cmd->config_arg4 = param->config_arg4;
++	cmd->config_arg5 = param->config_arg5;
++	cmd->config_arg6 = param->config_arg6;
++
++	return ath11k_wmi_cmd_send(wmi, skb, WMI_COEX_CONFIG_CMDID);
++}
++
+ int ath11k_wmi_simulate_radar(struct ath11k *ar)
+ {
+ 	struct ath11k_vif *arvif;
+diff --git a/drivers/net/wireless/ath/ath11k/wmi.h b/drivers/net/wireless/ath/ath11k/wmi.h
+index a8354022f575..a18723fe9aae 100644
+--- a/drivers/net/wireless/ath/ath11k/wmi.h
++++ b/drivers/net/wireless/ath/ath11k/wmi.h
+@@ -6332,6 +6332,82 @@ enum wmi_sta_keepalive_method {
+ 
+ const void **ath11k_wmi_tlv_parse_alloc(struct ath11k_base *ab, const void *ptr,
+ 					size_t len, gfp_t gfp);
++enum wmi_coex_config_type {
++    WMI_COEX_CONFIG_PAGE_P2P_TDM        =  1,
++    WMI_COEX_CONFIG_PAGE_STA_TDM        =  2,
++    WMI_COEX_CONFIG_PAGE_SAP_TDM        =  3,
++    WMI_COEX_CONFIG_DURING_WLAN_CONN    =  4,
++    WMI_COEX_CONFIG_BTC_ENABLE          =  5,
++    WMI_COEX_CONFIG_COEX_DBG            =  6,
++    WMI_COEX_CONFIG_PAGE_P2P_STA_TDM    =  7,
++    WMI_COEX_CONFIG_INQUIRY_P2P_TDM     =  8,
++    WMI_COEX_CONFIG_INQUIRY_STA_TDM     =  9,
++    WMI_COEX_CONFIG_INQUIRY_SAP_TDM     = 10,
++    WMI_COEX_CONFIG_INQUIRY_P2P_STA_TDM = 11,
++    WMI_COEX_CONFIG_TX_POWER            = 12,
++    WMI_COEX_CONFIG_PTA_CONFIG          = 13,
++    WMI_COEX_CONFIG_AP_TDM              = 14,
++    WMI_COEX_CONFIG_WLAN_SCAN_PRIORITY  = 15,
++    WMI_COEX_CONFIG_WLAN_PKT_PRIORITY   = 16,
++    WMI_COEX_CONFIG_PTA_INTERFACE       = 17,
++    WMI_COEX_CONFIG_BTC_DUTYCYCLE       = 18,
++    WMI_COEX_CONFIG_HANDOVER_RSSI       = 19,
++    WMI_COEX_CONFIG_PTA_BT_INFO         = 20,
++    WMI_COEX_CONFIG_SINK_WLAN_TDM       = 21,
++    WMI_COEX_CONFIG_COEX_ENABLE_MCC_TDM = 22,
++    WMI_COEX_CONFIG_LOWRSSI_A2DPOPP_TDM = 23,
++    WMI_COEX_CONFIG_BTC_MODE            = 24,
++    WMI_COEX_CONFIG_ANTENNA_ISOLATION   = 25,
++    WMI_COEX_CONFIG_BT_LOW_RSSI_THRESHOLD = 26,
++    WMI_COEX_CONFIG_BT_INTERFERENCE_LEVEL = 27,
++    WMI_COEX_CONFIG_WLAN_OVER_ZBLOW        = 28,
++    WMI_COEX_CONFIG_WLAN_MGMT_OVER_BT_A2DP = 29,
++    WMI_COEX_CONFIG_WLAN_CONN_OVER_LE      = 30,
++    WMI_COEX_CONFIG_LE_OVER_WLAN_TRAFFIC   = 31,
++    WMI_COEX_CONFIG_THREE_WAY_COEX_RESET   = 32,
++    WMI_COEX_CONFIG_THREE_WAY_DELAY_PARA   = 33,
++    WMI_COEX_CONFIG_THREE_WAY_COEX_START   = 34,
++    WMI_COEX_CONFIG_MPTA_HELPER_ENABLE     = 35,
++    WMI_COEX_CONFIG_MPTA_HELPER_ZIGBEE_STATE = 36,
++    WMI_COEX_CONFIG_MPTA_HELPER_INT_OCS_PARAMS = 37,
++    WMI_COEX_CONFIG_MPTA_HELPER_MON_OCS_PARAMS   = 38,
++    WMI_COEX_CONFIG_MPTA_HELPER_INT_MON_DURATION = 39,
++    WMI_COEX_CONFIG_MPTA_HELPER_ZIGBEE_CHANNEL   = 40,
++    WMI_COEX_CONFIG_MPTA_HELPER_WLAN_MUTE_DURATION   = 41,
++    WMI_COEX_CONFIG_BT_SCO_ALLOW_WLAN_2G_SCAN   = 42,
++    WMI_COEX_CONFIG_ENABLE_2ND_HARMONIC_WAR     = 43,
++    WMI_COEX_CONFIG_BTCOEX_SEPARATE_CHAIN_MODE  = 44,
++    WMI_COEX_CONFIG_ENABLE_TPUT_SHAPING = 45,
++    WMI_COEX_CONFIG_ENABLE_TXBF = 46,
++    WMI_COEX_CONFIG_FORCED_ALGO = 47,
++    WMI_COEX_CONFIG_LE_SCAN_POLICY = 48,
++};
++
++struct wmi_coex_config_params {
++	u32 vdev_id;
++	u32 config_type;
++	u32 config_arg1;
++	u32 config_arg2;
++	u32 config_arg3;
++	u32 config_arg4;
++	u32 config_arg5;
++	u32 config_arg6;
++};
++
++struct wmi_coex_config_cmd {
++	u32 tlv_header;
++	u32 vdev_id;
++	u32 config_type;
++	u32 config_arg1;
++	u32 config_arg2;
++	u32 config_arg3;
++	u32 config_arg4;
++	u32 config_arg5;
++	u32 config_arg6;
++} __packed;
++
++#define WMI_COEX_ISOLATION_ARG1_DEFAUT     30
++
+ int ath11k_wmi_cmd_send(struct ath11k_pdev_wmi *wmi, struct sk_buff *skb,
+ 			u32 cmd_id);
+ struct sk_buff *ath11k_wmi_alloc_skb(struct ath11k_wmi_base *wmi_sc, u32 len);
+@@ -6493,6 +6569,7 @@ int ath11k_wmi_scan_prob_req_oui(struct ath11k *ar,
+ 				 const u8 mac_addr[ETH_ALEN]);
+ int ath11k_wmi_fw_dbglog_cfg(struct ath11k *ar, u32 *module_id_bitmap,
+ 			     struct ath11k_fw_dbglog *dbglog);
++int ath11k_wmi_send_coex_config(struct ath11k *ar, struct wmi_coex_config_params *param);
+ int ath11k_wmi_wow_config_pno(struct ath11k *ar, u32 vdev_id,
+ 			      struct wmi_pno_scan_req  *pno_scan);
+ int ath11k_wmi_wow_del_pattern(struct ath11k *ar, u32 vdev_id, u32 pattern_id);
+
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: "neil.shi" <neil.shi@quectel.com>
+Date: Tue, 23 May 2023 17:41:00 +0800
+Subject: [PATCH] wifi: ath11k: merge all patches to 6.1.11, fix exceptions and
+ compilation errors
+
+Signed-off-by: neil.shi <neil.shi@quectel.com>
+Signed-off-by: Jan200101 <sentrycraft123@gmail.com>
+---
+ drivers/net/wireless/ath/ath11k/pci.c  | 35 ++++++++++++++++++--------
+ drivers/net/wireless/ath/ath11k/pcic.c | 11 ++++++++
+ 2 files changed, 36 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath11k/pci.c b/drivers/net/wireless/ath/ath11k/pci.c
+index 2fa4a99e7b08..88f11f6e47b7 100644
+--- a/drivers/net/wireless/ath/ath11k/pci.c
++++ b/drivers/net/wireless/ath/ath11k/pci.c
+@@ -110,7 +110,12 @@ static u32 ath11k_pci_window_read32(struct ath11k_base *ab, u32 offset)
+ 	struct ath11k_pci *ab_pci = ath11k_pci_priv(ab);
+ 	u32 window_start, val;
+ 
+-	window_start = ath11k_pci_get_window_start(ab, offset);
++	if (ab->hw_params.static_window_map)
++        	window_start = ath11k_pci_get_window_start(ab, offset);
++      	else
++        	window_start = ATH11K_PCI_WINDOW_START;
++
++	//window_start = ath11k_pci_get_window_start(ab, offset);
+ 
+ 	if (window_start == ATH11K_PCI_WINDOW_START) {
+ 		spin_lock_bh(&ab_pci->window_lock);
+@@ -735,6 +740,8 @@ static int ath11k_pci_probe(struct pci_dev *pdev,
+ 	u32 soc_hw_version_major, soc_hw_version_minor, addr;
+ 	const struct ath11k_pci_ops *pci_ops;
+ 	int ret;
++	u32 sub_version;
++	int ops_init = 0;
+ 
+ 	ab = ath11k_core_alloc(&pdev->dev, sizeof(*ab_pci), ATH11K_BUS_PCI);
+ 
+@@ -781,8 +788,8 @@ static int ath11k_pci_probe(struct pci_dev *pdev,
+ 	case QCA6390_DEVICE_ID:
+ 		ath11k_pci_read_hw_version(ab, &soc_hw_version_major,
+ 					   &soc_hw_version_minor);
+-		switch (soc_hw_version_major) {
+-		case 2:
++ 		switch (soc_hw_version_major) {
++ 		case 2:
+ 			ab->hw_rev = ATH11K_HW_QCA6390_HW20;
+ 			break;
+ 		default:
+@@ -802,6 +809,13 @@ static int ath11k_pci_probe(struct pci_dev *pdev,
+ 		ab->id.bdf_search = ATH11K_BDF_SEARCH_BUS_AND_BOARD;
+ 		ath11k_pci_read_hw_version(ab, &soc_hw_version_major,
+ 					   &soc_hw_version_minor);
++		pci_ops = &ath11k_pci_ops_qca6390;
++		ret = ath11k_pcic_register_pci_ops(ab, pci_ops);
++		if (ret) {
++			ath11k_err(ab, "failed to register PCI ops: %d\n", ret);
++			goto err_pci_free_region;
++		}
++		ops_init = 1;
+ 		switch (soc_hw_version_major) {
+ 		case 2:
+ 			switch (soc_hw_version_minor) {
+@@ -812,7 +826,7 @@ static int ath11k_pci_probe(struct pci_dev *pdev,
+ 			case 0x10:
+ 			case 0x11:
+ 				//ab->hw_rev = ATH11K_HW_WCN6855_HW21;
+-				sub_version = ath11k_pci_read32(ab, SUB_VERSION);
++				sub_version = ath11k_pcic_read32(ab, SUB_VERSION);
+ 				ath11k_dbg(ab, ATH11K_DBG_PCI, "sub_version 0x%x\n", sub_version);
+ 				switch (sub_version) {
+ 				case 0x1019A0E1:
+@@ -837,7 +851,6 @@ static int ath11k_pci_probe(struct pci_dev *pdev,
+ 			goto err_pci_free_region;
+ 		}
+ 
+-		pci_ops = &ath11k_pci_ops_qca6390;
+ 		break;
+ 	default:
+ 		dev_err(&pdev->dev, "Unknown PCI device found: 0x%x\n",
+@@ -846,11 +859,13 @@ static int ath11k_pci_probe(struct pci_dev *pdev,
+ 		goto err_pci_free_region;
+ 	}
+ 
+-	ret = ath11k_pcic_register_pci_ops(ab, pci_ops);
+-	if (ret) {
+-		ath11k_err(ab, "failed to register PCI ops: %d\n", ret);
+-		goto err_pci_free_region;
+-	}
++	if(ops_init == 1){
++		ret = ath11k_pcic_register_pci_ops(ab, pci_ops);
++		if (ret) {
++			ath11k_err(ab, "failed to register PCI ops: %d\n", ret);
++			goto err_pci_free_region;
++		}
++ 	}
+ 
+ 	ret = ath11k_pcic_init_msi_config(ab);
+ 	if (ret) {
+diff --git a/drivers/net/wireless/ath/ath11k/pcic.c b/drivers/net/wireless/ath/ath11k/pcic.c
+index 16d1e332193f..406eef086836 100644
+--- a/drivers/net/wireless/ath/ath11k/pcic.c
++++ b/drivers/net/wireless/ath/ath11k/pcic.c
+@@ -115,6 +115,17 @@ static const struct ath11k_msi_config ath11k_msi_config[] = {
+ 		},
+ 		.hw_rev = ATH11K_HW_WCN6750_HW10,
+ 	},
++	{
++		.total_vectors = 32,
++		.total_users = 4,
++		.users = (struct ath11k_msi_user[]) {
++			{ .name = "MHI", .num_vectors = 3, .base_vector = 0 },
++			{ .name = "CE", .num_vectors = 10, .base_vector = 3 },
++			{ .name = "WAKE", .num_vectors = 1, .base_vector = 13 },
++			{ .name = "DP", .num_vectors = 18, .base_vector = 14 },
++		},
++		.hw_rev = ATH11K_HW_QCA206X_HW21,
++	},
+ };
+ 
+ int ath11k_pcic_init_msi_config(struct ath11k_base *ab)
+
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Thomas Crider <gloriouseggroll@gmail.com>
+Date: Thu, 7 Dec 2023 17:22:18 -0500
+Subject: [PATCH] wifi-fixup
+
+Signed-off-by: Jan200101 <sentrycraft123@gmail.com>
+---
+ drivers/net/wireless/ath/ath11k/core.c | 7 ++-----
+ 1 file changed, 2 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/net/wireless/ath/ath11k/core.c b/drivers/net/wireless/ath/ath11k/core.c
+index e3c55b1e792e..b286707af6e2 100644
+--- a/drivers/net/wireless/ath/ath11k/core.c
++++ b/drivers/net/wireless/ath/ath11k/core.c
+@@ -420,7 +420,8 @@ static const struct ath11k_hw_params ath11k_hw_params[] = {
+ 		.supports_shadow_regs = true,
+ 		.idle_ps = true,
+ 		.supports_sta_ps = true,
+-		.cold_boot_calib = false,
++		.coldboot_cal_mm = false,
++		.coldboot_cal_ftm = false,
+ 		.fw_mem_mode = 0,
+ 		.num_vdevs = 16 + 1,
+ 		.num_peers = 512,
+@@ -433,7 +434,6 @@ static const struct ath11k_hw_params ath11k_hw_params[] = {
+ 		.hal_params = &ath11k_hw_hal_params_qca6390,
+ 		.supports_dynamic_smps_6ghz = false,
+ 		.alloc_cacheable_memory = false,
+-		.wakeup_mhi = true,
+ 		.supports_rssi_stats = true,
+ 		.fw_wmi_diag_event = true,
+ 		.current_cc_support = true,
+@@ -461,9 +461,6 @@ static const struct ath11k_hw_params ath11k_hw_params[] = {
+ 		.target_ce_count = 9,
+ 		.svc_to_ce_map = ath11k_target_service_to_ce_map_wlan_qca6390,
+ 		.svc_to_ce_map_len = 14,
+-		.rfkill_pin = 0,
+-		.rfkill_cfg = 0,
+-		.rfkill_on_level = 0,
+ 		.single_pdev_only = true,
+ 		.rxdma1_enable = false,
+ 		.num_rxmda_per_pdev = 2,
