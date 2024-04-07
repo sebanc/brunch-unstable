@@ -1,5 +1,5 @@
 diff --git a/drivers/hid/hid-nintendo.c b/drivers/hid/hid-nintendo.c
-index 4850e915a57d..ccc4032fb2b0 100644
+index 4850e915a57d..4b4ca990f968 100644
 --- a/drivers/hid/hid-nintendo.c
 +++ b/drivers/hid/hid-nintendo.c
 @@ -3,6 +3,9 @@
@@ -22,7 +22,15 @@ index 4850e915a57d..ccc4032fb2b0 100644
   * The driver will retrieve the factory calibration info from the controllers,
   * so little to no user calibration should be required.
   *
-@@ -305,9 +311,14 @@ enum joycon_ctlr_state {
+@@ -28,6 +34,7 @@
+ #include <linux/device.h>
+ #include <linux/kernel.h>
+ #include <linux/hid.h>
++#include <linux/idr.h>
+ #include <linux/input.h>
+ #include <linux/jiffies.h>
+ #include <linux/leds.h>
+@@ -305,9 +312,14 @@ enum joycon_ctlr_state {
  
  /* Controller type received as part of device info */
  enum joycon_ctlr_type {
@@ -40,7 +48,7 @@ index 4850e915a57d..ccc4032fb2b0 100644
  };
  
  struct joycon_stick_cal {
-@@ -348,6 +359,137 @@ struct joycon_imu_cal {
+@@ -348,6 +360,137 @@ struct joycon_imu_cal {
  #define JC_BTN_L	 BIT(22)
  #define JC_BTN_ZL	 BIT(23)
  
@@ -166,10 +174,10 @@ index 4850e915a57d..ccc4032fb2b0 100644
 +	{ BTN_TR,		JC_BTN_R,	},
 +	{ BTN_TR2,		JC_BTN_LSTICK,	}, /* ZR */
 +	{ BTN_START,		JC_BTN_PLUS,	},
-+	{ BTN_FORWARD,		JC_BTN_Y,	}, /* C UP */
-+	{ BTN_BACK,		JC_BTN_ZR,	}, /* C DOWN */
-+	{ BTN_LEFT,		JC_BTN_X,	}, /* C LEFT */
-+	{ BTN_RIGHT,		JC_BTN_MINUS,	}, /* C RIGHT */
++	{ BTN_SELECT,		JC_BTN_Y,	}, /* C UP */
++	{ BTN_X,		JC_BTN_ZR,	}, /* C DOWN */
++	{ BTN_Y,		JC_BTN_X,	}, /* C LEFT */
++	{ BTN_C,		JC_BTN_MINUS,	}, /* C RIGHT */
 +	{ BTN_MODE,		JC_BTN_HOME,	},
 +	{ BTN_Z,		JC_BTN_CAP,	},
 +	{ /* sentinel */ },
@@ -178,7 +186,7 @@ index 4850e915a57d..ccc4032fb2b0 100644
  enum joycon_msg_type {
  	JOYCON_MSG_TYPE_NONE,
  	JOYCON_MSG_TYPE_USB,
-@@ -410,6 +552,18 @@ static const char * const joycon_player_led_names[] = {
+@@ -410,11 +553,24 @@ static const char * const joycon_player_led_names[] = {
  	LED_FUNCTION_PLAYER4,
  };
  #define JC_NUM_LEDS		ARRAY_SIZE(joycon_player_led_names)
@@ -197,7 +205,13 @@ index 4850e915a57d..ccc4032fb2b0 100644
  
  /* Each physical controller is associated with a joycon_ctlr struct */
  struct joycon_ctlr {
-@@ -494,13 +648,182 @@ struct joycon_ctlr {
+ 	struct hid_device *hdev;
+ 	struct input_dev *input;
++	u32 player_id;
+ 	struct led_classdev leds[JC_NUM_LEDS]; /* player leds */
+ 	struct led_classdev home_led;
+ 	enum joycon_ctlr_state ctlr_state;
+@@ -494,13 +650,160 @@ struct joycon_ctlr {
  /* Does this controller have inputs associated with left joycon? */
  #define jc_type_has_left(ctlr) \
  	(ctlr->ctlr_type == JOYCON_CTLR_TYPE_JCL || \
@@ -221,16 +235,6 @@ index 4850e915a57d..ccc4032fb2b0 100644
 + * These helpers are most useful early during the HID probe or in conjunction
 + * with the capability helpers below.
 + */
-+static inline bool joycon_device_is_left_joycon(struct joycon_ctlr *ctlr)
-+{
-+	return ctlr->hdev->product == USB_DEVICE_ID_NINTENDO_JOYCONL;
-+}
-+
-+static inline bool joycon_device_is_right_joycon(struct joycon_ctlr *ctlr)
-+{
-+	return ctlr->hdev->product == USB_DEVICE_ID_NINTENDO_JOYCONR;
-+}
-+
 +static inline bool joycon_device_is_procon(struct joycon_ctlr *ctlr)
 +{
 +	return ctlr->hdev->product == USB_DEVICE_ID_NINTENDO_PROCON;
@@ -318,18 +322,6 @@ index 4850e915a57d..ccc4032fb2b0 100644
 +	return ctlr->ctlr_type == JOYCON_CTLR_TYPE_NESR;
 +}
 +
-+static inline bool joycon_type_has_left_controls(struct joycon_ctlr *ctlr)
-+{
-+	return joycon_type_is_left_joycon(ctlr) ||
-+	       joycon_type_is_procon(ctlr);
-+}
-+
-+static inline bool joycon_type_has_right_controls(struct joycon_ctlr *ctlr)
-+{
-+	return joycon_type_is_right_joycon(ctlr) ||
-+	       joycon_type_is_procon(ctlr);
-+}
-+
 +static inline bool joycon_type_is_any_joycon(struct joycon_ctlr *ctlr)
 +{
 +	return joycon_type_is_left_joycon(ctlr) ||
@@ -381,7 +373,7 @@ index 4850e915a57d..ccc4032fb2b0 100644
  static int __joycon_hid_send(struct hid_device *hdev, u8 *data, size_t len)
  {
  	u8 *buf;
-@@ -699,6 +1022,25 @@ static int joycon_set_player_leds(struct joycon_ctlr *ctlr, u8 flash, u8 on)
+@@ -699,6 +1002,25 @@ static int joycon_set_player_leds(struct joycon_ctlr *ctlr, u8 flash, u8 on)
  	return joycon_send_subcmd(ctlr, req, 1, HZ/4);
  }
  
@@ -407,7 +399,7 @@ index 4850e915a57d..ccc4032fb2b0 100644
  static int joycon_request_spi_flash_read(struct joycon_ctlr *ctlr,
  					 u32 start_addr, u8 size, u8 **reply)
  {
-@@ -1265,15 +1607,10 @@ static void joycon_parse_imu_report(struct joycon_ctlr *ctlr,
+@@ -1265,15 +1587,10 @@ static void joycon_parse_imu_report(struct joycon_ctlr *ctlr,
  	}
  }
  
@@ -424,7 +416,7 @@ index 4850e915a57d..ccc4032fb2b0 100644
  
  	spin_lock_irqsave(&ctlr->lock, flags);
  	if (IS_ENABLED(CONFIG_NINTENDO_FF) && rep->vibrator_report &&
-@@ -1292,11 +1629,21 @@ static void joycon_parse_report(struct joycon_ctlr *ctlr,
+@@ -1292,11 +1609,21 @@ static void joycon_parse_report(struct joycon_ctlr *ctlr,
  		queue_work(ctlr->rumble_queue, &ctlr->rumble_worker);
  	}
  
@@ -447,7 +439,7 @@ index 4850e915a57d..ccc4032fb2b0 100644
  	switch (tmp) {
  	case 0: /* empty */
  		ctlr->battery_capacity = POWER_SUPPLY_CAPACITY_LEVEL_CRITICAL;
-@@ -1318,102 +1665,121 @@ static void joycon_parse_report(struct joycon_ctlr *ctlr,
+@@ -1318,102 +1645,121 @@ static void joycon_parse_report(struct joycon_ctlr *ctlr,
  		hid_warn(ctlr->hdev, "Invalid battery status\n");
  		break;
  	}
@@ -661,7 +653,7 @@ index 4850e915a57d..ccc4032fb2b0 100644
  
  	spin_lock_irqsave(&ctlr->lock, flags);
  	ctlr->last_input_report_msecs = msecs;
-@@ -1453,7 +1819,7 @@ static void joycon_parse_report(struct joycon_ctlr *ctlr,
+@@ -1453,7 +1799,7 @@ static void joycon_parse_report(struct joycon_ctlr *ctlr,
  	}
  
  	/* parse IMU data if present */
@@ -670,7 +662,7 @@ index 4850e915a57d..ccc4032fb2b0 100644
  		joycon_parse_imu_report(ctlr, rep);
  }
  
-@@ -1666,123 +2032,65 @@ static int joycon_play_effect(struct input_dev *dev, void *data,
+@@ -1666,123 +2012,65 @@ static int joycon_play_effect(struct input_dev *dev, void *data,
  }
  #endif /* IS_ENABLED(CONFIG_NINTENDO_FF) */
  
@@ -847,7 +839,7 @@ index 4850e915a57d..ccc4032fb2b0 100644
  #if IS_ENABLED(CONFIG_NINTENDO_FF)
  	/* set up rumble */
  	input_set_capability(ctlr->input, EV_FF, FF_RUMBLE);
-@@ -1795,10 +2103,15 @@ static int joycon_input_create(struct joycon_ctlr *ctlr)
+@@ -1795,10 +2083,15 @@ static int joycon_input_create(struct joycon_ctlr *ctlr)
  	joycon_set_rumble(ctlr, 0, 0, false);
  	ctlr->rumble_msecs = jiffies_to_msecs(jiffies);
  #endif
@@ -866,7 +858,7 @@ index 4850e915a57d..ccc4032fb2b0 100644
  
  	/* configure the imu input device */
  	ctlr->imu_input = devm_input_allocate_device(&hdev->dev);
-@@ -1810,8 +2123,14 @@ static int joycon_input_create(struct joycon_ctlr *ctlr)
+@@ -1810,8 +2103,14 @@ static int joycon_input_create(struct joycon_ctlr *ctlr)
  	ctlr->imu_input->id.product = hdev->product;
  	ctlr->imu_input->id.version = hdev->version;
  	ctlr->imu_input->uniq = ctlr->mac_addr_str;
@@ -882,7 +874,7 @@ index 4850e915a57d..ccc4032fb2b0 100644
  	input_set_drvdata(ctlr->imu_input, ctlr);
  
  	/* configure imu axes */
-@@ -1853,6 +2172,72 @@ static int joycon_input_create(struct joycon_ctlr *ctlr)
+@@ -1853,6 +2152,72 @@ static int joycon_input_create(struct joycon_ctlr *ctlr)
  	return 0;
  }
  
@@ -955,7 +947,7 @@ index 4850e915a57d..ccc4032fb2b0 100644
  static int joycon_player_led_brightness_set(struct led_classdev *led,
  					    enum led_brightness brightness)
  {
-@@ -1862,7 +2247,6 @@ static int joycon_player_led_brightness_set(struct led_classdev *led,
+@@ -1862,7 +2227,6 @@ static int joycon_player_led_brightness_set(struct led_classdev *led,
  	int val = 0;
  	int i;
  	int ret;
@@ -963,7 +955,7 @@ index 4850e915a57d..ccc4032fb2b0 100644
  
  	ctlr = hid_get_drvdata(hdev);
  	if (!ctlr) {
-@@ -1870,21 +2254,10 @@ static int joycon_player_led_brightness_set(struct led_classdev *led,
+@@ -1870,21 +2234,10 @@ static int joycon_player_led_brightness_set(struct led_classdev *led,
  		return -ENODEV;
  	}
  
@@ -987,7 +979,7 @@ index 4850e915a57d..ccc4032fb2b0 100644
  	ret = joycon_set_player_leds(ctlr, 0, val);
  	mutex_unlock(&ctlr->output_mutex);
  
-@@ -1897,9 +2270,6 @@ static int joycon_home_led_brightness_set(struct led_classdev *led,
+@@ -1897,9 +2250,6 @@ static int joycon_home_led_brightness_set(struct led_classdev *led,
  	struct device *dev = led->dev->parent;
  	struct hid_device *hdev = to_hid_device(dev);
  	struct joycon_ctlr *ctlr;
@@ -997,7 +989,7 @@ index 4850e915a57d..ccc4032fb2b0 100644
  	int ret;
  
  	ctlr = hid_get_drvdata(hdev);
-@@ -1907,43 +2277,35 @@ static int joycon_home_led_brightness_set(struct led_classdev *led,
+@@ -1907,75 +2257,73 @@ static int joycon_home_led_brightness_set(struct led_classdev *led,
  		hid_err(hdev, "No controller data\n");
  		return -ENODEV;
  	}
@@ -1021,7 +1013,8 @@ index 4850e915a57d..ccc4032fb2b0 100644
  }
  
 -static DEFINE_MUTEX(joycon_input_num_mutex);
-+static DEFINE_SPINLOCK(joycon_input_num_spinlock);
++static DEFINE_IDA(nintendo_player_id_allocator);
++
  static int joycon_leds_create(struct joycon_ctlr *ctlr)
  {
  	struct hid_device *hdev = ctlr->hdev;
@@ -1034,10 +1027,7 @@ index 4850e915a57d..ccc4032fb2b0 100644
 +	int ret;
  	int i;
 -	static int input_num = 1;
-+	unsigned long flags;
-+	int player_led_pattern;
-+	static int input_num;
- 
+-
 -	/* Set the default controller player leds based on controller number */
 -	mutex_lock(&joycon_input_num_mutex);
 -	mutex_lock(&ctlr->output_mutex);
@@ -1045,18 +1035,21 @@ index 4850e915a57d..ccc4032fb2b0 100644
 -	if (ret)
 -		hid_warn(ctlr->hdev, "Failed to set leds; ret=%d\n", ret);
 -	mutex_unlock(&ctlr->output_mutex);
-+	/*
-+	 * Set the player leds based on controller number
-+	 * Because there is no standard concept of "player number", the pattern
-+	 * number will simply increase by 1 every time a controller is connected.
-+	 */
-+	spin_lock_irqsave(&joycon_input_num_spinlock, flags);
-+	player_led_pattern = input_num++ % JC_NUM_LED_PATTERNS;
-+	spin_unlock_irqrestore(&joycon_input_num_spinlock, flags);
++	int player_led_pattern;
  
  	/* configure the player LEDs */
++	ctlr->player_id = U32_MAX;
++	ret = ida_alloc(&nintendo_player_id_allocator, GFP_KERNEL);
++	if (ret < 0) {
++		hid_warn(hdev, "Failed to allocate player ID, skipping; ret=%d\n", ret);
++		goto home_led;
++	}
++	ctlr->player_id = ret;
++	player_led_pattern = ret % JC_NUM_LED_PATTERNS;
++	hid_info(ctlr->hdev, "assigned player %d led pattern", player_led_pattern + 1);
++
  	for (i = 0; i < JC_NUM_LEDS; i++) {
-@@ -1951,31 +2313,37 @@ static int joycon_leds_create(struct joycon_ctlr *ctlr)
+ 		name = devm_kasprintf(dev, GFP_KERNEL, "%s:%s:%s",
  				      d_name,
  				      "green",
  				      joycon_player_led_names[i]);
@@ -1104,7 +1097,7 @@ index 4850e915a57d..ccc4032fb2b0 100644
  	/* configure the home LED */
  	if (jc_type_has_right(ctlr)) {
  		name = devm_kasprintf(dev, GFP_KERNEL, "%s:%s:%s",
-@@ -1991,16 +2359,20 @@ static int joycon_leds_create(struct joycon_ctlr *ctlr)
+@@ -1991,16 +2339,20 @@ static int joycon_leds_create(struct joycon_ctlr *ctlr)
  		led->max_brightness = 0xF;
  		led->brightness_set_blocking = joycon_home_led_brightness_set;
  		led->flags = LED_CORE_SUSPENDRESUME | LED_HW_PLUGGABLE;
@@ -1132,7 +1125,7 @@ index 4850e915a57d..ccc4032fb2b0 100644
  		}
  	}
  
-@@ -2101,9 +2473,7 @@ static int joycon_read_info(struct joycon_ctlr *ctlr)
+@@ -2101,9 +2453,7 @@ static int joycon_read_info(struct joycon_ctlr *ctlr)
  	struct joycon_input_report *report;
  
  	req.subcmd_id = JC_SUBCMD_REQ_DEV_INFO;
@@ -1142,7 +1135,7 @@ index 4850e915a57d..ccc4032fb2b0 100644
  	if (ret) {
  		hid_err(ctlr->hdev, "Failed to get joycon info; ret=%d\n", ret);
  		return ret;
-@@ -2126,8 +2496,17 @@ static int joycon_read_info(struct joycon_ctlr *ctlr)
+@@ -2126,8 +2476,17 @@ static int joycon_read_info(struct joycon_ctlr *ctlr)
  		return -ENOMEM;
  	hid_info(ctlr->hdev, "controller MAC = %s\n", ctlr->mac_addr_str);
  
@@ -1161,7 +1154,7 @@ index 4850e915a57d..ccc4032fb2b0 100644
  
  	return 0;
  }
-@@ -2139,8 +2518,7 @@ static int joycon_init(struct hid_device *hdev)
+@@ -2139,14 +2498,16 @@ static int joycon_init(struct hid_device *hdev)
  
  	mutex_lock(&ctlr->output_mutex);
  	/* if handshake command fails, assume ble pro controller */
@@ -1171,7 +1164,18 @@ index 4850e915a57d..ccc4032fb2b0 100644
  		hid_dbg(hdev, "detected USB controller\n");
  		/* set baudrate for improved latency */
  		ret = joycon_send_usb(ctlr, JC_USB_CMD_BAUDRATE_3M, HZ);
-@@ -2165,24 +2543,43 @@ static int joycon_init(struct hid_device *hdev)
+ 		if (ret) {
+-			hid_err(hdev, "Failed to set baudrate; ret=%d\n", ret);
+-			goto out_unlock;
++			/*
++			 * We can function with the default baudrate.
++			 * Provide a warning, and continue on.
++			 */
++			hid_warn(hdev, "Failed to set baudrate (ret=%d), continuing anyway\n", ret);
+ 		}
+ 		/* handshake */
+ 		ret = joycon_send_usb(ctlr, JC_USB_CMD_HANDSHAKE, HZ);
+@@ -2165,24 +2526,43 @@ static int joycon_init(struct hid_device *hdev)
  		goto out_unlock;
  	}
  
@@ -1230,7 +1234,7 @@ index 4850e915a57d..ccc4032fb2b0 100644
  	}
  
  	/* Set the reporting mode to 0x30, which is the full report mode */
-@@ -2192,18 +2589,13 @@ static int joycon_init(struct hid_device *hdev)
+@@ -2192,18 +2572,13 @@ static int joycon_init(struct hid_device *hdev)
  		goto out_unlock;
  	}
  
@@ -1256,7 +1260,7 @@ index 4850e915a57d..ccc4032fb2b0 100644
  	}
  
  out_unlock:
-@@ -2348,13 +2740,6 @@ static int nintendo_hid_probe(struct hid_device *hdev,
+@@ -2348,13 +2723,6 @@ static int nintendo_hid_probe(struct hid_device *hdev,
  		goto err_close;
  	}
  
@@ -1270,7 +1274,15 @@ index 4850e915a57d..ccc4032fb2b0 100644
  	/* Initialize the leds */
  	ret = joycon_leds_create(ctlr);
  	if (ret) {
-@@ -2426,6 +2811,12 @@ static int nintendo_hid_resume(struct hid_device *hdev)
+@@ -2404,6 +2772,7 @@ static void nintendo_hid_remove(struct hid_device *hdev)
+ 	spin_unlock_irqrestore(&ctlr->lock, flags);
+ 
+ 	destroy_workqueue(ctlr->rumble_queue);
++	ida_free(&nintendo_player_id_allocator, ctlr->player_id);
+ 
+ 	hid_hw_close(hdev);
+ 	hid_hw_stop(hdev);
+@@ -2426,6 +2795,12 @@ static int nintendo_hid_resume(struct hid_device *hdev)
  static const struct hid_device_id nintendo_hid_devices[] = {
  	{ HID_USB_DEVICE(USB_VENDOR_ID_NINTENDO,
  			 USB_DEVICE_ID_NINTENDO_PROCON) },
@@ -1283,7 +1295,7 @@ index 4850e915a57d..ccc4032fb2b0 100644
  	{ HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_NINTENDO,
  			 USB_DEVICE_ID_NINTENDO_PROCON) },
  	{ HID_USB_DEVICE(USB_VENDOR_ID_NINTENDO,
-@@ -2434,6 +2825,12 @@ static const struct hid_device_id nintendo_hid_devices[] = {
+@@ -2434,6 +2809,12 @@ static const struct hid_device_id nintendo_hid_devices[] = {
  			 USB_DEVICE_ID_NINTENDO_JOYCONL) },
  	{ HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_NINTENDO,
  			 USB_DEVICE_ID_NINTENDO_JOYCONR) },
@@ -1296,8 +1308,24 @@ index 4850e915a57d..ccc4032fb2b0 100644
  	{ }
  };
  MODULE_DEVICE_TABLE(hid, nintendo_hid_devices);
-@@ -2452,6 +2849,7 @@ static struct hid_driver nintendo_hid_driver = {
- module_hid_driver(nintendo_hid_driver);
+@@ -2449,9 +2830,22 @@ static struct hid_driver nintendo_hid_driver = {
+ 	.resume		= nintendo_hid_resume,
+ #endif
+ };
+-module_hid_driver(nintendo_hid_driver);
++static int __init nintendo_init(void)
++{
++	return hid_register_driver(&nintendo_hid_driver);
++}
++
++static void __exit nintendo_exit(void)
++{
++	hid_unregister_driver(&nintendo_hid_driver);
++	ida_destroy(&nintendo_player_id_allocator);
++}
++
++module_init(nintendo_init);
++module_exit(nintendo_exit);
  
  MODULE_LICENSE("GPL");
 +MODULE_AUTHOR("Ryan McClelland <rymcclel@gmail.com>");
@@ -1306,18 +1334,54 @@ index 4850e915a57d..ccc4032fb2b0 100644
  MODULE_DESCRIPTION("Driver for Nintendo Switch Controllers");
 -
 diff --git a/drivers/hid/hid-ids.h b/drivers/hid/hid-ids.h
-index 09a77fa3fc1e..67eec3e70355 100644
+index 36dcf1548041..53d08f6d41bc 100644
 --- a/drivers/hid/hid-ids.h
 +++ b/drivers/hid/hid-ids.h
-@@ -989,7 +989,10 @@
+@@ -990,7 +990,10 @@
  #define USB_DEVICE_ID_NINTENDO_JOYCONL	0x2006
  #define USB_DEVICE_ID_NINTENDO_JOYCONR	0x2007
  #define USB_DEVICE_ID_NINTENDO_PROCON	0x2009
 -#define USB_DEVICE_ID_NINTENDO_CHRGGRIP	0x200E
-+#define USB_DEVICE_ID_NINTENDO_CHRGGRIP        0x200e
-+#define USB_DEVICE_ID_NINTENDO_SNESCON 0x2017
-+#define USB_DEVICE_ID_NINTENDO_GENCON  0x201e
-+#define USB_DEVICE_ID_NINTENDO_N64CON  0x2019
++#define USB_DEVICE_ID_NINTENDO_CHRGGRIP	0x200e
++#define USB_DEVICE_ID_NINTENDO_SNESCON	0x2017
++#define USB_DEVICE_ID_NINTENDO_GENCON	0x201e
++#define USB_DEVICE_ID_NINTENDO_N64CON	0x2019
  
  #define USB_VENDOR_ID_NOVATEK		0x0603
  #define USB_DEVICE_ID_NOVATEK_PCT	0x0600
+diff --git a/drivers/hid/Kconfig b/drivers/hid/Kconfig
+index 628a46590e4f..ff3d53ceae9c 100644
+--- a/drivers/hid/Kconfig
++++ b/drivers/hid/Kconfig
+@@ -761,14 +761,15 @@ config HID_MULTITOUCH
+ 	  module will be called hid-multitouch.
+ 
+ config HID_NINTENDO
+-	tristate "Nintendo Joy-Con and Pro Controller support"
++	tristate "Nintendo Joy-Con, NSO, and Pro Controller support"
+ 	depends on NEW_LEDS
+ 	depends on LEDS_CLASS
+ 	select POWER_SUPPLY
+ 	help
+-	Adds support for the Nintendo Switch Joy-Cons and Pro Controller.
++	Adds support for the Nintendo Switch Joy-Cons, NSO, Pro Controller.
+ 	All controllers support bluetooth, and the Pro Controller also supports
+-	its USB mode.
++	its USB mode. This also includes support for the Nintendo Switch Online
++	Controllers which include the Genesis, SNES, and N64 controllers.
+ 
+ 	To compile this driver as a module, choose M here: the
+ 	module will be called hid-nintendo.
+@@ -779,9 +780,9 @@ config NINTENDO_FF
+ 	select INPUT_FF_MEMLESS
+ 	help
+ 	Say Y here if you have a Nintendo Switch controller and want to enable
+-	force feedback support for it. This works for both joy-cons and the pro
+-	controller. For the pro controller, both rumble motors can be controlled
+-	individually.
++	force feedback support for it. This works for both joy-cons, the pro
++	controller, and the NSO N64 controller. For the pro controller, both
++	rumble motors can be controlled individually.
+ 
+ config HID_NTI
+ 	tristate "NTI keyboard adapters"
