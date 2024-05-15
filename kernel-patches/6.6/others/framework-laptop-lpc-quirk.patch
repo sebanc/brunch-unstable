@@ -1,0 +1,60 @@
+commit 3f59a396eaec5ebd9cc9f6f19c629410c38391a7
+Author: Dustin L. Howett <dustin@howett.net>
+Date:   Tue Apr 2 19:47:13 2024 -0500
+
+    platform/chrome: cros_ec_lpc: add quirks for the Framework Laptop (AMD)
+    
+    The original Framework Laptop 13 platform (Intel 11th, 12th, and 13th
+    Generation at this time) uses a Microchip embedded controller in a
+    standard configuration.
+    
+    The newer devices in this product line--Framework Laptop 13 and 16 (AMD
+    Ryzen)--use a NPCX embedded controller. However, they deviate from the
+    configuration of ChromeOS platforms built with the NPCX EC.
+    
+    * The MMIO region for EC memory begins at port 0xE00 rather than the
+      expected 0x900.
+    
+    cros_ec_lpc's quirks system is used to address this issue.
+    
+    Signed-off-by: Dustin L. Howett <dustin@howett.net>
+    Reviewed-by: Thomas Weißschuh <linux@weissschuh.net>
+    Tested-by: Thomas Weißschuh <linux@weissschuh.net>
+    Tested-by: Mario Limonciello <superm1@gmail.com>
+    Link: https://lore.kernel.org/r/20240403004713.130365-5-dustin@howett.net
+    Signed-off-by: Tzung-Bi Shih <tzungbi@kernel.org>
+
+diff --git a/drivers/platform/chrome/cros_ec_lpc.c b/drivers/platform/chrome/cros_ec_lpc.c
+index ed498278a223..cfcdffae18b5 100644
+--- a/drivers/platform/chrome/cros_ec_lpc.c
++++ b/drivers/platform/chrome/cros_ec_lpc.c
+@@ -492,6 +492,11 @@ static const struct acpi_device_id cros_ec_lpc_acpi_device_ids[] = {
+ };
+ MODULE_DEVICE_TABLE(acpi, cros_ec_lpc_acpi_device_ids);
+ 
++static const struct lpc_driver_data framework_laptop_amd_lpc_driver_data __initconst = {
++	.quirks = CROS_EC_LPC_QUIRK_REMAP_MEMORY,
++	.quirk_mmio_memory_base = 0xE00,
++};
++
+ static const struct dmi_system_id cros_ec_lpc_dmi_table[] __initconst = {
+ 	{
+ 		/*
+@@ -546,7 +551,16 @@ static const struct dmi_system_id cros_ec_lpc_dmi_table[] __initconst = {
+ 	},
+ 	/* A small number of non-Chromebook/box machines also use the ChromeOS EC */
+ 	{
+-		/* the Framework Laptop */
++		/* the Framework Laptop 13 (AMD Ryzen) and 16 (AMD Ryzen) */
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "Framework"),
++			DMI_MATCH(DMI_PRODUCT_NAME, "AMD Ryzen"),
++			DMI_MATCH(DMI_PRODUCT_FAMILY, "Laptop"),
++		},
++		.driver_data = (void *)&framework_laptop_amd_lpc_driver_data,
++	},
++	{
++		/* the Framework Laptop (Intel 11th, 12th, 13th Generation) */
+ 		.matches = {
+ 			DMI_MATCH(DMI_SYS_VENDOR, "Framework"),
+ 			DMI_MATCH(DMI_PRODUCT_NAME, "Laptop"),
