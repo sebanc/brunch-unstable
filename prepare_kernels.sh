@@ -43,7 +43,7 @@ for kernel in $kernels; do
 	echo "kernel_version=$kernel_version"
 	[ ! "x$kernel_version" == "x" ] || { echo "Kernel version not found"; exit 1; }
 	case "$kernel" in
-		6.12|6.6|6.1)
+		6.12|6.6)
 			echo "Downloading ChromiumOS kernel source for kernel $kernel version $kernel_version from https://chromium.googlesource.com/chromiumos/third_party/kernel/+archive/$kernel_remote_path$kernel.tar.gz"
 			curl -L "https://chromium.googlesource.com/chromiumos/third_party/kernel/+archive/$kernel_remote_path$kernel.tar.gz" -o "./kernels/chromiumos-$kernel.tar.gz" || { echo "Kernel source download failed"; exit 1; }
 			mkdir "./kernels/chromebook-$kernel" "./kernels/$kernel"
@@ -72,6 +72,6 @@ rm -rf ./kernels
 mkdir ./kernels
 
 chromeos_version="R135"
-kernels="5.4 5.10 5.15 6.1 6.6 6.12"
+kernels="6.6 6.12"
 download_and_patch_kernels
 
