@@ -16,27 +16,18 @@ if [ "$ithc_touchscreen" -eq 1 ]; then
 	echo "brunch: $0 ithc enabled" > /dev/kmsg
 	cat >/roota/etc/init/ithc.conf <<ITHC
 start on stopped udev-trigger
+stop on shutdown
+respawn
+oom score never
 script
-	insmod /lib/modules/$(cat /proc/version |  cut -d' ' -f3)/ithc.ko
-	sleep 2
-	iptsd \$(iptsd-find-hidraw)
+    if ! lsmod | grep -q '^ithc'; then
+        insmod /lib/modules/$(cat /proc/version |  cut -d' ' -f3)/ithc.ko 2>/dev/null || true
+        sleep 2
+    fi
+
+    exec iptsd \$(iptsd-find-hidraw)
 end script
 ITHC
-	if [ ! "$?" -eq 0 ]; then ret=$((ret + (2 ** 0))); fi
-	cat >/roota/etc/init/ithc-resume.conf <<ITHCRESUMEFIX
-start on stopped udev-trigger
-script
-	dbus-monitor --system --profile "interface='org.chromium.PowerManager',member='SuspendDone'" | while read -r line; do
-		pkill -x iptsd || true
-		if lsmod | grep -q '^ithc'; then
-			rmmod ithc 2>/dev/null || true
-			insmod /lib/modules/$(cat /proc/version |  cut -d' ' -f3)/ithc.ko
-		fi
-		sleep 2
-		iptsd \$(iptsd-find-hidraw)
-	done
-end script
-ITHCRESUMEFIX
 	if [ ! "$?" -eq 0 ]; then ret=$((ret + (2 ** 1))); fi
 	tar zxf /rootc/packages/ipts.tar.gz -C /roota
 	if [ ! "$?" -eq 0 ]; then ret=$((ret + (2 ** 2))); fi
