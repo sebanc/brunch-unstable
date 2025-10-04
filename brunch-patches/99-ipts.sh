@@ -28,9 +28,9 @@ script
     exec iptsd \$(iptsd-find-hidraw)
 end script
 ITHC
-	if [ ! "$?" -eq 0 ]; then ret=$((ret + (2 ** 1))); fi
+	if [ ! "$?" -eq 0 ]; then ret=$((ret + (2 ** 0))); fi
 	tar zxf /rootc/packages/ipts.tar.gz -C /roota
-	if [ ! "$?" -eq 0 ]; then ret=$((ret + (2 ** 2))); fi
+	if [ ! "$?" -eq 0 ]; then ret=$((ret + (2 ** 1))); fi
 elif [ "$ipts_touchscreen" -eq 1 ]; then
 	echo "brunch: $0 ipts enabled" > /dev/kmsg
 	cat >/roota/etc/init/ipts.conf <<IPTS
@@ -41,7 +41,7 @@ script
 	iptsd \$(iptsd-find-hidraw)
 end script
 IPTS
-	if [ ! "$?" -eq 0 ]; then ret=$((ret + (2 ** 3))); fi
+	if [ ! "$?" -eq 0 ]; then ret=$((ret + (2 ** 2))); fi
 	cat >/roota/etc/init/ipts-resume.conf <<ITPSRESUMEFIX
 start on stopped udev-trigger
 script
@@ -56,9 +56,9 @@ script
 	done
 end script
 ITPSRESUMEFIX
-	if [ ! "$?" -eq 0 ]; then ret=$((ret + (2 ** 4))); fi
+	if [ ! "$?" -eq 0 ]; then ret=$((ret + (2 ** 3))); fi
 	tar zxf /rootc/packages/ipts.tar.gz -C /roota
-	if [ ! "$?" -eq 0 ]; then ret=$((ret + (2 ** 5))); fi
+	if [ ! "$?" -eq 0 ]; then ret=$((ret + (2 ** 4))); fi
 fi
 
 exit $ret
