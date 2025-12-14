@@ -164,9 +164,11 @@ cp ../haveged-pkg/usr/lib64/libhavege.so* ../initramfs/lib64/ || { echo "Failed 
 cd .. || { echo "Failed to make haveged"; exit 1; }
 rm -rf ./haveged || { echo "Failed to make haveged"; exit 1; }
 
-git clone --depth=1 -b 4.6.1 https://github.com/plougher/squashfs-tools.git || { echo "Failed to make squashfs-tools"; exit 1; }
+git clone --depth=1 -b 4.7.4 https://github.com/plougher/squashfs-tools.git || { echo "Failed to make squashfs-tools"; exit 1; }
 cd squashfs-tools/squashfs-tools || { echo "Failed to make squashfs-tools"; exit 1; }
 sed "s/#XZ_SUPPORT/XZ_SUPPORT/" -i Makefile || { echo "Failed to make squashfs-tools"; exit 1; }
+sed "s/LZO_SUPPORT/#LZO_SUPPORT/" -i Makefile || { echo "Failed to make squashfs-tools"; exit 1; }
+sed "s/LZ4_SUPPORT/#LZ4_SUPPORT/" -i Makefile || { echo "Failed to make squashfs-tools"; exit 1; }
 make -j"$NTHREADS" || { echo "Failed to make squashfs-tools"; exit 1; }
 for i in $(ldd mksquashfs | cut -d' ' -f3); do cp "$i" ../../initramfs/lib64/ || { echo "Failed to make squashfs-tools"; exit 1; }; done
 cp mksquashfs ../../initramfs/bin/ || { echo "Failed to make squashfs-tools"; exit 1; }
