@@ -27,6 +27,8 @@ elif [ "$board" == "octopus" ]; then
 	hwid="BOBBA"
 elif [ "$board" == "rammus" ]; then
 	hwid="SHYVANA"
+elif [ "$board" == "rex" ]; then
+	hwid="KANIX-USMZ"
 elif [ "$board" == "skyrim" ]; then
 	hwid="MARKARTH-VVBN"
 elif [ "$board" == "volteer" ]; then
