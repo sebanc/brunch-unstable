@@ -80,7 +80,7 @@ for i in $(ldd ../base-pkg/usr/bin/iptsd | grep -v '/base-pkg/' | cut -d' ' -f3)
 cd .. || { echo "Failed to make iptsd"; exit 1; }
 rm -rf ./iptsd || { echo "Failed to make iptsd"; exit 1; }
 
-git clone -b v0.9.7 https://github.com/stefanberger/libtpms.git libtpms || { echo "Failed to make libtpms"; exit 1; }
+git clone -b v0.10.1 https://github.com/stefanberger/libtpms.git libtpms || { echo "Failed to make libtpms"; exit 1; }
 cd ./libtpms || { echo "Failed to make libtpms"; exit 1; }
 ./autogen.sh --prefix=/usr --libdir=/usr/lib64 --with-openssl --with-tpm2 --disable-tests || { echo "Failed to make libtpms"; exit 1; }
 make -j"$NTHREADS" || { echo "Failed to make libtpms"; exit 1; }
@@ -89,7 +89,7 @@ sed -i "s#/usr#/home/chronos/base-pkg/usr#g" /home/chronos/base-pkg/usr/lib64/pk
 cd .. || { echo "Failed to make libtpms"; exit 1; }
 rm -rf ./libtpms || { echo "Failed to make libtpms"; exit 1; }
 
-git clone -b v0.9.0 https://github.com/stefanberger/swtpm.git swtpm || { echo "Failed to make swtpm"; exit 1; }
+git clone -b v0.10.1 https://github.com/stefanberger/swtpm.git swtpm || { echo "Failed to make swtpm"; exit 1; }
 cd ./swtpm || { echo "Failed to make swtpm"; exit 1; }
 ./autogen.sh --prefix=/usr --libdir=/usr/lib64 --disable-python-installation --disable-tests with_seccomp=no with_gnutls=no with_cuse=no || { echo "Failed to make swtpm"; exit 1; }
 make -j"$NTHREADS" || { echo "Failed to make swtpm"; exit 1; }
