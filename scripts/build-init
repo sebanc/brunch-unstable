@@ -137,7 +137,7 @@ for i in $(ldd ./fbv | cut -d' ' -f3); do cp "$i" ../initramfs/lib64/ || { echo 
 cd .. || { echo "Failed to make fbv"; exit 1; }
 rm -rf ./fbv || { echo "Failed to make fbv"; exit 1; }
 
-git clone --depth=1 -b v1.9.18 https://github.com/jirka-h/haveged.git || { echo "Failed to make haveged"; exit 1; }
+git clone --depth=1 -b v1.9.19 https://github.com/jirka-h/haveged.git || { echo "Failed to make haveged"; exit 1; }
 cd haveged || { echo "Failed to make haveged"; exit 1; }
 autoreconf -i || { echo "Failed to make haveged"; exit 1; }
 ./configure --prefix=/usr --libdir=/usr/lib64 --disable-init --enable-tune=no || { echo "Failed to make haveged"; exit 1; }
