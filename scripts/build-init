@@ -139,8 +139,8 @@ rm -rf ./fbv || { echo "Failed to make fbv"; exit 1; }
 
 git clone --depth=1 -b v1.9.19 https://github.com/jirka-h/haveged.git || { echo "Failed to make haveged"; exit 1; }
 cd haveged || { echo "Failed to make haveged"; exit 1; }
-autoreconf -i || { echo "Failed to make haveged"; exit 1; }
-./configure --prefix=/usr --libdir=/usr/lib64 --disable-init --enable-tune=no || { echo "Failed to make haveged"; exit 1; }
+autoreconf -fi || { echo "Failed to make haveged"; exit 1; }
+./configure --prefix=/usr --libdir=/usr/lib64 --enable-tune=no || { echo "Failed to make haveged"; exit 1; }
 make -j"$NTHREADS" || { echo "Failed to make haveged"; exit 1; }
 make DESTDIR=/home/chronos/haveged-pkg install || { echo "Failed to make haveged"; exit 1; }
 cp ../haveged-pkg/usr/sbin/haveged ../initramfs/sbin/ || { echo "Failed to make haveged"; exit 1; }
