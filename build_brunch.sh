@@ -277,8 +277,8 @@ tar zcf ../rootc/packages/alsa-ucm-conf.tar.gz * --owner=0 --group=0 || { echo "
 cd .. || { echo "Failed to cleanup ucm configuration directory"; exit 1; }
 rm -r ./alsa-ucm-conf || { echo "Failed to cleanup ucm configuration directory"; exit 1; }
 
-curl -L https://gitlab.com/kernel-firmware/linux-firmware/-/archive/main/linux-firmware-main.tar.gz -o linux-firmware.tar --retry 5 || { echo "Failed to download the linux firmware tarball"; exit 1; }
-tar -xf linux-firmware.tar --one-top-level=linux-firmware --strip-components=1 || { echo "Failed to extract the linux firmware tarball"; exit 1; }
+curl -L https://gitlab.com/kernel-firmware/linux-firmware/-/archive/main/linux-firmware-main.tar.gz -o linux-firmware.tar.gz --retry 5 || { echo "Failed to download the linux firmware tarball"; exit 1; }
+tar -xvzf linux-firmware.tar.gz --one-top-level=linux-firmware --strip-components=1 || { echo "Failed to extract the linux firmware tarball"; exit 1; }
 
 cd ./linux-firmware || { echo "Failed to enter the linux firmware directory"; exit 1; }
 make DESTDIR=./tmp FIRMWAREDIR=/lib/firmware install || { echo "Failed to install firmwares in temporary directory"; exit 1; }
