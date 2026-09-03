@@ -1,0 +1,18 @@
+diff --git a/drivers/gpu/drm/i915/display/intel_fbdev.c b/drivers/gpu/drm/i915/display/intel_fbdev.c
+index a42b0943ed95f..3b2676af5526c 100644
+--- a/drivers/gpu/drm/i915/display/intel_fbdev.c
++++ b/drivers/gpu/drm/i915/display/intel_fbdev.c
+@@ -253,10 +253,10 @@ int intel_fbdev_driver_fbdev_probe(struct drm_fb_helper *helper,
+ 	ifbdev->fb = NULL;
+ 
+ 	if (fb &&
+-	    (sizes->fb_width > fb->base.width ||
+-	     sizes->fb_height > fb->base.height)) {
++	    (sizes->fb_width != fb->base.width ||
++	     sizes->fb_height != fb->base.height)) {
+ 		drm_dbg_kms(display->drm,
+-			    "BIOS fb too small (%dx%d), we require (%dx%d),"
++			    "BIOS fb not valid (%dx%d), we require (%dx%d),"
+ 			    " releasing it\n",
+ 			    fb->base.width, fb->base.height,
+ 			    sizes->fb_width, sizes->fb_height);
