@@ -130,10 +130,10 @@ rm -rf ./usr/include ./usr/lib64 ./usr/lib/brunch-base/*.a ./usr/lib/brunch-base
 tar zcvf ../rootc/packages/base.tar.gz * --owner=0 --group=0 || { echo "Failed to make base"; exit 1; }
 cd .. || { echo "Failed to make base"; exit 1; }
 
-git clone --depth=1 -b master https://github.com/godspeed1989/fbv.git fbv || { echo "Failed to make fbv"; exit 1; }
+git clone --depth=1 -b master https://github.com/sebanc/fbv.git fbv || { echo "Failed to make fbv"; exit 1; }
 cd ./fbv || { echo "Failed to make fbv"; exit 1; }
 ./configure --prefix=/ || { echo "Failed to make fbv"; exit 1; }
-make -j"$NTHREADS" || { echo "Failed to make fbv"; exit 1; }
+LDFLAGS="-ljpeg -lpng" make -j"$NTHREADS" || { echo "Failed to make fbv"; exit 1; }
 cp ./fbv ../initramfs/bin/ || { echo "Failed to make fbv"; exit 1; }
 for i in $(ldd ./fbv | cut -d' ' -f3); do cp "$i" ../initramfs/lib64/ || { echo "Failed to make fbv"; exit 1; }; done
 cd .. || { echo "Failed to make fbv"; exit 1; }

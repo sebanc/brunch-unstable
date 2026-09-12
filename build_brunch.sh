@@ -273,7 +273,7 @@ rm -r ./chroot/tmp/kernel || { echo "Failed to cleanup for kernel $kernel"; exit
 done
 
 cd ./chroot/home/chronos || { echo "Failed to switch to chronos directory"; exit 1; }
-git clone --depth=1 -b v$(curl -L https://chromium.googlesource.com/chromiumos/overlays/chromiumos-overlay/+/refs/heads/release-$(cat ../../chromeos/etc/lsb-release | grep 'CHROMEOS_RELEASE_BUILDER_PATH=' | cut -d'/' -f2 | cut -d '.' -f1).B/media-libs/alsa-lib/ | sed 's@>@\n@g' | grep '^alsa-lib-' | head -1 | cut -d '-' -f3) https://github.com/alsa-project/alsa-ucm-conf.git || { echo "Failed to clone the alsa-ucm-conf git"; exit 1; }
+git clone --depth=1 -b v$(LD_LIBRARY_PATH=../../chromeos/lib64:../../chromeos/usr/lib64 ../../chromeos/lib64/ld-linux-x86-64.so.2 ../../chromeos/usr/bin/alsaucm --version | cut -d' ' -f3) https://github.com/alsa-project/alsa-ucm-conf.git || { echo "Failed to clone the alsa-ucm-conf git"; exit 1; }
 rm -r ./alsa-ucm-conf/.github ./alsa-ucm-conf/.gitignore ./alsa-ucm-conf/LICENSE ./alsa-ucm-conf/README.md ./alsa-ucm-conf/VERSION || { echo "Failed to clone the alsa-ucm-conf git"; exit 1; }
 sed -i 's@Define.V1 ""@Define.V1 yes@g' ./alsa-ucm-conf/ucm2/ucm.conf || { echo "Failed to modify ucm configuration"; exit 1; }
 cp -rT ../../chromeos/usr/share/alsa/ucm ./alsa-ucm-conf/ucm || { echo "Failed to copy ChromeOS ucm configurations"; exit 1; }
