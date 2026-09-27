@@ -85,7 +85,7 @@ done
 rm -rf ./kernels
 mkdir ./kernels
 
-chromeos_version="R154"
+chromeos_version="R155"
 kernels="6.6 6.12 6.18"
 download_and_patch_kernels
 
