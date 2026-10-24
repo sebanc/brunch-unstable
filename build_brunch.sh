@@ -277,6 +277,7 @@ git clone --depth=1 -b v$(LD_LIBRARY_PATH=../../chromeos/lib64:../../chromeos/us
 rm -r ./alsa-ucm-conf/.github ./alsa-ucm-conf/.gitignore ./alsa-ucm-conf/LICENSE ./alsa-ucm-conf/README.md ./alsa-ucm-conf/VERSION || { echo "Failed to clone the alsa-ucm-conf git"; exit 1; }
 sed -i 's@Define.V1 ""@Define.V1 yes@g' ./alsa-ucm-conf/ucm2/ucm.conf || { echo "Failed to modify ucm configuration"; exit 1; }
 cp -rT ../../chromeos/usr/share/alsa/ucm ./alsa-ucm-conf/ucm || { echo "Failed to copy ChromeOS ucm configurations"; exit 1; }
+cp -rT --remove-destination ../../chromeos/usr/share/alsa/ucm2/conf.d ./alsa-ucm-conf/ucm2/conf.d || { echo "Failed to copy ChromeOS ucm configurations"; exit 1; }
 cp -rT ../../../alsa-ucm-conf ./alsa-ucm-conf || { echo "Failed to copy custom ucm configurations"; exit 1; }
 cd ./alsa-ucm-conf || { echo "Failed to switch to ucm configuration directory"; exit 1; }
 tar zcf ../rootc/packages/alsa-ucm-conf.tar.gz * --owner=0 --group=0 || { echo "Failed to create ucm configuration archive"; exit 1; }
