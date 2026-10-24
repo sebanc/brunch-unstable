@@ -26,6 +26,7 @@ rm -r /roota/lib/firmware/*
 if [ ! "$?" -eq 0 ]; then ret=$((ret + (2 ** 0))); fi
 tar zxf /rootc/packages/firmwares.tar.gz -C /roota/lib/firmware
 if [ ! "$?" -eq 0 ]; then ret=$((ret + (2 ** 1))); fi
+rm -rf /roota/usr/share/alsa/ucm2
 tar zxf /rootc/packages/alsa-ucm-conf.tar.gz -C /roota/usr/share/alsa
 if [ ! "$?" -eq 0 ]; then ret=$((ret + (2 ** 2))); fi
 
