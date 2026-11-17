@@ -1,0 +1,1587 @@
+x86: emulate AVX2, FMA3, BMI1/2, F16C, MOVBE, GFNI, AVX-VNNI and SHA-NI in #UD
+
+On x86-64 CPUs that implement AVX but lack some of these extensions (Sandy
+Bridge, Ivy Bridge, ...), binaries that use them unconditionally die with
+SIGILL. Add an optional (CONFIG_X86_AVXEMU, default n) emulator that runs
+from handle_invalid_op() for 64-bit user mode:
+
+ - the faulting instruction is fetched with insn_fetch_from_user(), decoded
+   and executed by a freestanding scalar-integer core (no SIMD, no libm, no
+   libgcc helpers) on a copy of the task GPR and XMM/YMM state;
+ - VEX encodings (AVX2, FMA3, BMI1/2, F16C, GFNI, AVX-VNNI) and legacy SSE
+   encodings (MOVBE, SHA-NI, GFNI) are handled; legacy 128-bit memory
+   operands must be 16-byte aligned (#GP -> SIGSEGV otherwise) and only bits
+   127:0 of the destination are written;
+ - memory operands go through copy_{from,to}_user(); a bad operand address
+   raises SIGSEGV with the operand address as si_addr and leaves state
+   untouched;
+ - results are committed to pt_regs and the task fpstate (marked stale so it
+   is reloaded on return to user), then RIP is advanced;
+ - anything not recognised, or an extension the CPU actually has, falls
+   through to the normal SIGILL path;
+ - CPUID is not altered. "avxemu=0" disables it at boot.
+
+Counters are exposed in debugfs (x86/avxemu_{emulated,declined,faulted}).
+
+diff -urN a/arch/x86/Kconfig b/arch/x86/Kconfig
+--- a/arch/x86/Kconfig	2026-11-01 15:56:06.124908707 +0000
++++ b/arch/x86/Kconfig	2026-11-01 20:47:32.426574931 +0000
+@@ -1758,6 +1758,27 @@
+ 	  specific cases in protected and virtual-8086 modes. Emulated
+ 	  results are dummy.
+ 
++config X86_AVXEMU
++	bool "Emulate AVX2, FMA3, BMI1/2, F16C, MOVBE, GFNI, AVX-VNNI and SHA-NI"
++	depends on X86_64
++	default y
++	help
++	  On x86-64 CPUs that implement AVX but not (all of) AVX2, FMA3, BMI1,
++	  BMI2, F16C, MOVBE, GFNI, AVX-VNNI and SHA-NI (for example Sandy Bridge
++	  and Ivy Bridge), user space that executes those instructions normally
++	  dies with SIGILL.
++	  This option emulates them in the invalid-opcode exception handler,
++	  so such binaries run, slowly (microseconds per instruction).
++
++	  CPUID is not modified: software that checks CPUID keeps using its
++	  fallback code paths. Unsupported instructions still raise SIGILL.
++	  Emulation is skipped entirely on CPUs that have every extension.
++
++	  This adds an instruction decoder that acts on user-controlled bytes
++	  to the kernel; it only ever touches user memory through
++	  copy_{from,to}_user() and the task's saved register state. It can
++	  be disabled at boot with "avxemu=0".
++
+ config CC_HAS_IBT
+ 	# GCC >= 9 and binutils >= 2.29
+ 	# Retpoline check to work around https://gcc.gnu.org/bugzilla/show_bug.cgi?id=93654
+diff -urN a/arch/x86/include/asm/traps.h b/arch/x86/include/asm/traps.h
+--- a/arch/x86/include/asm/traps.h	2026-11-01 15:56:06.162082829 +0000
++++ b/arch/x86/include/asm/traps.h	2026-11-01 15:56:06.167423165 +0000
+@@ -57,4 +57,10 @@
+ 		local_irq_disable();
+ }
+ 
++#ifdef CONFIG_X86_AVXEMU
++bool avxemu_handle_ud(struct pt_regs *regs);
++#else
++static inline bool avxemu_handle_ud(struct pt_regs *regs) { return false; }
++#endif
++
+ #endif /* _ASM_X86_TRAPS_H */
+diff -urN a/arch/x86/kernel/fpu/Makefile b/arch/x86/kernel/fpu/Makefile
+--- a/arch/x86/kernel/fpu/Makefile	2026-11-01 15:56:06.149433039 +0000
++++ b/arch/x86/kernel/fpu/Makefile	2026-11-01 15:56:06.154974317 +0000
+@@ -4,3 +4,4 @@
+ #
+ 
+ obj-y				+= init.o bugs.o core.o regset.o signal.o xstate.o
++obj-$(CONFIG_X86_AVXEMU)	+= avxemu/
+diff -urN a/arch/x86/kernel/fpu/avxemu/Makefile b/arch/x86/kernel/fpu/avxemu/Makefile
+--- a/arch/x86/kernel/fpu/avxemu/Makefile	1970-01-01 00:00:00.000000000 +0000
++++ b/arch/x86/kernel/fpu/avxemu/Makefile	2026-11-01 20:47:32.428513442 +0000
+@@ -0,0 +1,2 @@
++# SPDX-License-Identifier: GPL-2.0-only
++obj-y += avxemu_glue.o avxemu_core.o avxemu_fma.o
+diff -urN a/arch/x86/kernel/fpu/avxemu/avxemu_core.c b/arch/x86/kernel/fpu/avxemu/avxemu_core.c
+--- a/arch/x86/kernel/fpu/avxemu/avxemu_core.c	1970-01-01 00:00:00.000000000 +0000
++++ b/arch/x86/kernel/fpu/avxemu/avxemu_core.c	2026-11-01 20:47:32.428722191 +0000
+@@ -0,0 +1,931 @@
++// SPDX-License-Identifier: GPL-2.0
++#include "avxemu_core.h"
++#include "avxemu_fma.h"
++
++typedef struct { int mod, reg, rm, riprel, base, index, scale, len; s64 disp; } modrm_t;
++typedef struct { u8 map, pp, L, W, opc, mod, imm; int reg, rm, vvvv, len; u64 ea; } insn_t;
++typedef union { u8 b[16]; s8 sb[16]; u16 w[8]; s16 sw[8]; u32 d[4]; s32 sd[4]; u64 q[2]; s64 sq[2]; } lane_t;
++typedef struct avxemu_cpu emu_cpu;
++
++#define FAULT (-1)
++#define RDRM(buf, n) do { if (rd_rm(c, d, (buf), (n))) return FAULT; } while (0)
++
++static u32 ld32(const u8 *p) { u32 v; memcpy(&v, p, 4); return v; }
++
++static void parse_modrm(const u8 *p, int rR, int rX, int rB, modrm_t *m)
++{
++	int n = 0, rm, idx;
++	u8 b = p[n++];
++
++	m->mod = b >> 6;
++	m->reg = ((b >> 3) & 7) | (rR << 3);
++	rm = b & 7;
++	m->riprel = 0; m->base = m->index = -1; m->scale = 0; m->disp = 0; m->rm = -1;
++	if (m->mod == 3) { m->rm = rm | (rB << 3); m->len = n; return; }
++	if (rm == 4) {
++		u8 s = p[n++];
++
++		m->scale = s >> 6;
++		idx = ((s >> 3) & 7) | (rX << 3);
++		if (idx != 4)
++			m->index = idx;
++		if ((s & 7) == 5 && m->mod == 0) { m->disp = (s32)ld32(p + n); n += 4; }
++		else m->base = (s & 7) | (rB << 3);
++	} else if (rm == 5 && m->mod == 0) {
++		m->riprel = 1; m->disp = (s32)ld32(p + n); n += 4;
++	} else {
++		m->base = rm | (rB << 3);
++	}
++	if (m->mod == 1) m->disp = (s8)p[n++];
++	else if (m->mod == 2) { m->disp = (s32)ld32(p + n); n += 4; }
++	m->len = n;
++}
++
++static u64 calc_ea(const emu_cpu *c, const modrm_t *m, u64 next_rip)
++{
++	u64 ea = (u64)m->disp;
++
++	if (m->riprel) ea += next_rip;
++	if (m->base >= 0) ea += c->gpr[m->base];
++	if (m->index >= 0) ea += c->gpr[m->index] << m->scale;
++	return ea;
++}
++
++static int mem_rd(emu_cpu *c, u64 ea, void *dst, unsigned n)
++{
++	if (c->rd(c, ea, dst, n)) { c->fault_addr = ea; return -1; }
++	return 0;
++}
++static int mem_wr(emu_cpu *c, u64 ea, const void *src, unsigned n)
++{
++	if (c->wr(c, ea, src, n)) { c->fault_addr = ea; return -1; }
++	return 0;
++}
++
++static int rd_rm(emu_cpu *c, const insn_t *d, u8 *out, int n)
++{
++	memset(out, 0, 32);
++	if (d->mod == 3) { memcpy(out, c->ymm[d->rm], n); return 0; }
++	return mem_rd(c, d->ea, out, n);
++}
++
++/* write result; vb==16 zeroes bits 255:128 (VEX.128 semantics); v may alias the register */
++static void wr_v(emu_cpu *c, int r, const u8 *v, int vb)
++{
++	u8 t[32];
++
++	memcpy(t, v, vb);
++	memset(c->ymm[r], 0, 32);
++	memcpy(c->ymm[r], t, vb);
++}
++
++/* ------------------------------------------------- in-lane integer ops */
++static s8  sat_s8(s32 v)  { return v > 127 ? 127 : v < -128 ? -128 : v; }
++static u8  sat_u8(s32 v)  { return v > 255 ? 255 : v < 0 ? 0 : v; }
++static s16 sat_s16(s32 v) { return v > 32767 ? 32767 : v < -32768 ? -32768 : v; }
++static u16 sat_u16(s32 v) { return v > 65535 ? 65535 : v < 0 ? 0 : v; }
++#define MIN(a, b) ((a) < (b) ? (a) : (b))
++#define MAX(a, b) ((a) > (b) ? (a) : (b))
++#define FOR(n) for (i = 0; i < (n); i++)
++
++static int lane_op(const insn_t *d, const lane_t *a, const lane_t *b, lane_t *r)
++{
++	int i;
++
++	if (d->pp != 1)
++		return 0;
++	if (d->map == 1) switch (d->opc) {
++	case 0x60: FOR(8) { r->b[2*i] = a->b[i]; r->b[2*i+1] = b->b[i]; } return 1;
++	case 0x61: FOR(4) { r->w[2*i] = a->w[i]; r->w[2*i+1] = b->w[i]; } return 1;
++	case 0x62: r->d[0] = a->d[0]; r->d[1] = b->d[0]; r->d[2] = a->d[1]; r->d[3] = b->d[1]; return 1;
++	case 0x63: FOR(8) { r->sb[i] = sat_s8(a->sw[i]); r->sb[8+i] = sat_s8(b->sw[i]); } return 1;
++	case 0x64: FOR(16) r->b[i] = a->sb[i] > b->sb[i] ? 0xff : 0; return 1;
++	case 0x65: FOR(8) r->w[i] = a->sw[i] > b->sw[i] ? 0xffff : 0; return 1;
++	case 0x66: FOR(4) r->d[i] = a->sd[i] > b->sd[i] ? 0xffffffffu : 0; return 1;
++	case 0x67: FOR(8) { r->b[i] = sat_u8(a->sw[i]); r->b[8+i] = sat_u8(b->sw[i]); } return 1;
++	case 0x68: FOR(8) { r->b[2*i] = a->b[8+i]; r->b[2*i+1] = b->b[8+i]; } return 1;
++	case 0x69: FOR(4) { r->w[2*i] = a->w[4+i]; r->w[2*i+1] = b->w[4+i]; } return 1;
++	case 0x6A: r->d[0] = a->d[2]; r->d[1] = b->d[2]; r->d[2] = a->d[3]; r->d[3] = b->d[3]; return 1;
++	case 0x6B: FOR(4) { r->sw[i] = sat_s16(a->sd[i]); r->sw[4+i] = sat_s16(b->sd[i]); } return 1;
++	case 0x6C: r->q[0] = a->q[0]; r->q[1] = b->q[0]; return 1;
++	case 0x6D: r->q[0] = a->q[1]; r->q[1] = b->q[1]; return 1;
++	case 0x74: FOR(16) r->b[i] = a->b[i] == b->b[i] ? 0xff : 0; return 1;
++	case 0x75: FOR(8) r->w[i] = a->w[i] == b->w[i] ? 0xffff : 0; return 1;
++	case 0x76: FOR(4) r->d[i] = a->d[i] == b->d[i] ? 0xffffffffu : 0; return 1;
++	case 0xD4: FOR(2) r->q[i] = a->q[i] + b->q[i]; return 1;
++	case 0xD5: FOR(8) r->w[i] = (u16)((u32)a->w[i] * b->w[i]); return 1;
++	case 0xD8: FOR(16) r->b[i] = a->b[i] > b->b[i] ? a->b[i] - b->b[i] : 0; return 1;
++	case 0xD9: FOR(8) r->w[i] = a->w[i] > b->w[i] ? a->w[i] - b->w[i] : 0; return 1;
++	case 0xDA: FOR(16) r->b[i] = MIN(a->b[i], b->b[i]); return 1;
++	case 0xDB: FOR(2) r->q[i] = a->q[i] & b->q[i]; return 1;
++	case 0xDC: FOR(16) r->b[i] = MIN(255, a->b[i] + b->b[i]); return 1;
++	case 0xDD: FOR(8) r->w[i] = MIN(65535, a->w[i] + b->w[i]); return 1;
++	case 0xDE: FOR(16) r->b[i] = MAX(a->b[i], b->b[i]); return 1;
++	case 0xDF: FOR(2) r->q[i] = ~a->q[i] & b->q[i]; return 1;
++	case 0xE0: FOR(16) r->b[i] = (a->b[i] + b->b[i] + 1) >> 1; return 1;
++	case 0xE3: FOR(8) r->w[i] = ((u32)a->w[i] + b->w[i] + 1) >> 1; return 1;
++	case 0xE4: FOR(8) r->w[i] = ((u32)a->w[i] * b->w[i]) >> 16; return 1;
++	case 0xE5: FOR(8) r->sw[i] = ((s32)a->sw[i] * b->sw[i]) >> 16; return 1;
++	case 0xE8: FOR(16) r->sb[i] = sat_s8((s32)a->sb[i] - b->sb[i]); return 1;
++	case 0xE9: FOR(8) r->sw[i] = sat_s16((s32)a->sw[i] - b->sw[i]); return 1;
++	case 0xEA: FOR(8) r->sw[i] = MIN(a->sw[i], b->sw[i]); return 1;
++	case 0xEB: FOR(2) r->q[i] = a->q[i] | b->q[i]; return 1;
++	case 0xEC: FOR(16) r->sb[i] = sat_s8((s32)a->sb[i] + b->sb[i]); return 1;
++	case 0xED: FOR(8) r->sw[i] = sat_s16((s32)a->sw[i] + b->sw[i]); return 1;
++	case 0xEE: FOR(8) r->sw[i] = MAX(a->sw[i], b->sw[i]); return 1;
++	case 0xEF: FOR(2) r->q[i] = a->q[i] ^ b->q[i]; return 1;
++	case 0xF4: r->q[0] = (u64)a->d[0] * b->d[0]; r->q[1] = (u64)a->d[2] * b->d[2]; return 1;
++	case 0xF5: FOR(4) r->d[i] = (u32)((s32)a->sw[2*i] * b->sw[2*i]) + (u32)((s32)a->sw[2*i+1] * b->sw[2*i+1]); return 1;
++	case 0xF6: {
++		u64 s0 = 0, s1 = 0;
++		FOR(8) { s0 += a->b[i] > b->b[i] ? a->b[i] - b->b[i] : b->b[i] - a->b[i];
++			 s1 += a->b[8+i] > b->b[8+i] ? a->b[8+i] - b->b[8+i] : b->b[8+i] - a->b[8+i]; }
++		r->q[0] = s0; r->q[1] = s1; return 1;
++	}
++	case 0xF8: FOR(16) r->b[i] = a->b[i] - b->b[i]; return 1;
++	case 0xF9: FOR(8) r->w[i] = a->w[i] - b->w[i]; return 1;
++	case 0xFA: FOR(4) r->d[i] = a->d[i] - b->d[i]; return 1;
++	case 0xFB: FOR(2) r->q[i] = a->q[i] - b->q[i]; return 1;
++	case 0xFC: FOR(16) r->b[i] = a->b[i] + b->b[i]; return 1;
++	case 0xFD: FOR(8) r->w[i] = a->w[i] + b->w[i]; return 1;
++	case 0xFE: FOR(4) r->d[i] = a->d[i] + b->d[i]; return 1;
++	default: return 0;
++	}
++	if (d->map == 2) switch (d->opc) {
++	case 0x00: FOR(16) r->b[i] = (b->b[i] & 0x80) ? 0 : a->b[b->b[i] & 15]; return 1;
++	case 0x01: FOR(4) { r->w[i] = a->w[2*i] + a->w[2*i+1]; r->w[4+i] = b->w[2*i] + b->w[2*i+1]; } return 1;
++	case 0x02: r->d[0] = a->d[0] + a->d[1]; r->d[1] = a->d[2] + a->d[3];
++		   r->d[2] = b->d[0] + b->d[1]; r->d[3] = b->d[2] + b->d[3]; return 1;
++	case 0x03: FOR(4) { r->sw[i] = sat_s16((s32)a->sw[2*i] + a->sw[2*i+1]); r->sw[4+i] = sat_s16((s32)b->sw[2*i] + b->sw[2*i+1]); } return 1;
++	case 0x04: FOR(8) r->sw[i] = sat_s16((s32)a->b[2*i] * b->sb[2*i] + (s32)a->b[2*i+1] * b->sb[2*i+1]); return 1;
++	case 0x05: FOR(4) { r->w[i] = a->w[2*i] - a->w[2*i+1]; r->w[4+i] = b->w[2*i] - b->w[2*i+1]; } return 1;
++	case 0x06: r->d[0] = a->d[0] - a->d[1]; r->d[1] = a->d[2] - a->d[3];
++		   r->d[2] = b->d[0] - b->d[1]; r->d[3] = b->d[2] - b->d[3]; return 1;
++	case 0x07: FOR(4) { r->sw[i] = sat_s16((s32)a->sw[2*i] - a->sw[2*i+1]); r->sw[4+i] = sat_s16((s32)b->sw[2*i] - b->sw[2*i+1]); } return 1;
++	case 0x08: FOR(16) r->b[i] = b->sb[i] < 0 ? (u8)(0 - a->b[i]) : b->sb[i] == 0 ? 0 : a->b[i]; return 1;
++	case 0x09: FOR(8) r->w[i] = b->sw[i] < 0 ? (u16)(0 - a->w[i]) : b->sw[i] == 0 ? 0 : a->w[i]; return 1;
++	case 0x0A: FOR(4) r->d[i] = b->sd[i] < 0 ? 0u - a->d[i] : b->sd[i] == 0 ? 0 : a->d[i]; return 1;
++	case 0x0B: FOR(8) r->sw[i] = ((((s32)a->sw[i] * b->sw[i]) >> 14) + 1) >> 1; return 1;
++	case 0x1C: FOR(16) r->b[i] = b->sb[i] < 0 ? (u8)(0 - b->b[i]) : b->b[i]; return 1;
++	case 0x1D: FOR(8) r->w[i] = b->sw[i] < 0 ? (u16)(0 - b->w[i]) : b->w[i]; return 1;
++	case 0x1E: FOR(4) r->d[i] = b->sd[i] < 0 ? 0u - b->d[i] : b->d[i]; return 1;
++	case 0x28: r->sq[0] = (s64)a->sd[0] * b->sd[0]; r->sq[1] = (s64)a->sd[2] * b->sd[2]; return 1;
++	case 0x29: FOR(2) r->q[i] = a->q[i] == b->q[i] ? ~0ull : 0; return 1;
++	case 0x2B: FOR(4) { r->w[i] = sat_u16(a->sd[i]); r->w[4+i] = sat_u16(b->sd[i]); } return 1;
++	case 0x37: FOR(2) r->q[i] = a->sq[i] > b->sq[i] ? ~0ull : 0; return 1;
++	case 0x38: FOR(16) r->sb[i] = MIN(a->sb[i], b->sb[i]); return 1;
++	case 0x39: FOR(4) r->sd[i] = MIN(a->sd[i], b->sd[i]); return 1;
++	case 0x3A: FOR(8) r->w[i] = MIN(a->w[i], b->w[i]); return 1;
++	case 0x3B: FOR(4) r->d[i] = MIN(a->d[i], b->d[i]); return 1;
++	case 0x3C: FOR(16) r->sb[i] = MAX(a->sb[i], b->sb[i]); return 1;
++	case 0x3D: FOR(4) r->sd[i] = MAX(a->sd[i], b->sd[i]); return 1;
++	case 0x3E: FOR(8) r->w[i] = MAX(a->w[i], b->w[i]); return 1;
++	case 0x3F: FOR(4) r->d[i] = MAX(a->d[i], b->d[i]); return 1;
++	case 0x40: FOR(4) r->d[i] = a->d[i] * b->d[i]; return 1;
++	default: return 0;
++	}
++	return 0;
++}
++
++enum { SH_SRLW, SH_SRLD, SH_SRLQ, SH_SRAW, SH_SRAD, SH_SLLW, SH_SLLD, SH_SLLQ, SH_SRLDQ, SH_SLLDQ };
++static void lane_shift(int op, const lane_t *a, u64 n, lane_t *r)
++{
++	int i, k;
++
++	switch (op) {
++	case SH_SRLW: FOR(8) r->w[i] = n > 15 ? 0 : a->w[i] >> n; break;
++	case SH_SRLD: FOR(4) r->d[i] = n > 31 ? 0 : a->d[i] >> n; break;
++	case SH_SRLQ: FOR(2) r->q[i] = n > 63 ? 0 : a->q[i] >> n; break;
++	case SH_SRAW: FOR(8) r->sw[i] = a->sw[i] >> (n > 15 ? 15 : n); break;
++	case SH_SRAD: FOR(4) r->sd[i] = a->sd[i] >> (n > 31 ? 31 : n); break;
++	case SH_SLLW: FOR(8) r->w[i] = n > 15 ? 0 : (u16)(a->w[i] << n); break;
++	case SH_SLLD: FOR(4) r->d[i] = n > 31 ? 0 : a->d[i] << n; break;
++	case SH_SLLQ: FOR(2) r->q[i] = n > 63 ? 0 : a->q[i] << n; break;
++	case SH_SRLDQ: k = n > 15 ? 16 : (int)n; FOR(16) r->b[i] = i + k < 16 ? a->b[i + k] : 0; break;
++	default:       k = n > 15 ? 16 : (int)n; FOR(16) r->b[i] = i >= k ? a->b[i - k] : 0; break;
++	}
++}
++
++/* ------------------------------------------------------------- F16C */
++static u32 h2f(u16 h)
++{
++	u32 s = (u32)(h & 0x8000) << 16, e = (h >> 10) & 0x1f, m = h & 0x3ff;
++
++	if (e == 0) {
++		int sh;
++
++		if (!m) return s;
++		sh = __builtin_clz(m) - 21;
++		m = (m << sh) & 0x3ff;
++		return s | ((u32)(113 - sh) << 23) | (m << 13);
++	}
++	if (e == 31) return s | 0x7f800000u | (m << 13) | (m ? 0x400000u : 0);
++	return s | ((e + 112) << 23) | (m << 13);
++}
++static u16 f2h_ovf(u32 s, int rm, u32 *fl)
++{
++	int inf = rm == 0 || (rm == 1 && s) || (rm == 2 && !s);
++
++	*fl |= AVX_FL_OE | AVX_FL_PE;
++	return (u16)(s | (inf ? 0x7c00 : 0x7bff));
++}
++static u16 f2h(u32 x, int rm, u32 *fl)
++{
++	u32 s = (x >> 16) & 0x8000, e = (x >> 23) & 0xff, m = x & 0x7fffff, sig, q, rem, half, h;
++	int exph = (int)e - 112, drop, inc;
++
++	if (e == 0xff) {
++		if (m) { if (!(m & 0x400000)) *fl |= AVX_FL_IE; return (u16)(s | 0x7e00 | (m >> 13)); }
++		return (u16)(s | 0x7c00);
++	}
++	if (!e && m) *fl |= AVX_FL_DE;
++	if (exph >= 31) return f2h_ovf(s, rm, fl);
++	sig = e ? (m | 0x800000) : m;
++	drop = !e ? 32 : exph <= 0 ? 14 - exph : 13;
++	if (drop >= 25) { q = 0; rem = sig != 0; half = 2; }
++	else { q = sig >> drop; rem = sig & ((1u << drop) - 1); half = 1u << (drop - 1); }
++	inc = rm == 0 ? (rem > half || (rem == half && (q & 1))) :
++	      rm == 1 ? (s && rem) : rm == 2 ? (!s && rem) : 0;
++	h = (exph > 0 ? (u32)(exph - 1) << 10 : 0) + q + inc;
++	if (h >= 0x7c00) return f2h_ovf(s, rm, fl);
++	if (rem) {
++		*fl |= AVX_FL_PE;
++		if (h < 0x400 || (exph <= 0 && h == 0x400 && !inc))   /* result denormal */
++			*fl |= AVX_FL_UE;
++	}
++	return (u16)(s | h);
++}
++
++/* -------------------------------------------------------------- FMA3 */
++static int emu_fma(emu_cpu *c, const insn_t *d)
++{
++	int hi = d->opc >> 4, k = d->opc & 15, form, scalar, type, esz, vb, n, i, kk;
++	u8 D[32], S2[32], S3[32], R[32];
++	const u8 *X, *Y, *Z;
++	u32 fl = 0;
++	int rm = (c->mxcsr >> 13) & 3;
++
++	if (k < 6) return 0;
++	form = hi == 9 ? 132 : hi == 0xA ? 213 : 231;
++	scalar = k >= 9 && (k & 1);
++	type = k == 6 ? 4 : k == 7 ? 5 : (k - 8) >> 1;     /* 0 madd 1 msub 2 nmadd 3 nmsub 4 maddsub 5 msubadd */
++	esz = d->W ? 8 : 4;
++	vb = scalar ? esz : (d->L ? 32 : 16);
++	n = vb / esz;
++	memcpy(D, c->ymm[d->reg], 32); memcpy(S2, c->ymm[d->vvvv], 32);
++	RDRM(S3, vb);
++	memcpy(R, D, 32);
++	X = form == 132 ? D : S2; Y = form == 213 ? D : S3; Z = form == 132 ? S2 : form == 213 ? S3 : D;
++	for (i = 0; i < n; i++) {
++		/* x86 NaN rules: first NaN operand in syntax order (dest, vvvv, r/m) wins, quieted;
++		 * invalid operations give the default QNaN. */
++		const u8 *src[3] = { D + esz * i, S2 + esz * i, S3 + esz * i };
++		u64 xa = 0, ya = 0, za = 0, res = 0, nanres = 0, sign = (u64)1 << (esz * 8 - 1);
++		int have_nan = 0;
++
++		memcpy(&xa, X + esz * i, esz); memcpy(&ya, Y + esz * i, esz); memcpy(&za, Z + esz * i, esz);
++		for (kk = 0; kk < 3; kk++) {
++			u64 t = 0;
++
++			memcpy(&t, src[kk], esz);
++			if (esz == 8 ? ((t & ~sign) > 0x7ff0000000000000ull) : ((t & ~sign) > 0x7f800000ull)) {
++				if (!have_nan) nanres = t | (esz == 8 ? 1ull << 51 : 1ull << 22);
++				if (!(t & (esz == 8 ? 1ull << 51 : 1ull << 22))) fl |= AVX_FL_IE;
++				have_nan = 1;
++			}
++		}
++		if (have_nan) {
++			res = nanres;
++		} else {
++			/* fold the variant into operand signs: fmsub: c=-c, fnmadd: a=-a, fnmsub: both */
++			int neg_c = type == 1 || type == 3 || (type == 4 && !(i & 1)) || (type == 5 && (i & 1));
++			int neg_a = type == 2 || type == 3;
++
++			if (neg_c) za ^= sign;
++			if (neg_a) xa ^= sign;
++			res = esz == 8 ? avx_fma64(xa, ya, za, rm, &fl) : avx_fma32((u32)xa, (u32)ya, (u32)za, rm, &fl);
++		}
++		memcpy(R + esz * i, &res, esz);
++	}
++	c->mxcsr |= fl;
++	if (scalar || !d->L) memset(R + 16, 0, 16);
++	memcpy(c->ymm[d->reg], R, 32);
++	return 1;
++}
++
++/* ------------------------------------------------------- BMI1/BMI2 */
++enum { ANDN, BLSR, BLSMSK, BLSI, BEXTR, SHLX, SARX, SHRX, BZHI, PEXT, PDEP, MULX, RORX };
++#define F_CF 0x001u
++#define F_ZF 0x040u
++#define F_SF 0x080u
++#define F_OF 0x800u
++static int emu_bmi(emu_cpu *c, const insn_t *d)
++{
++	int op, ext = d->reg & 7, w = d->W, bits = w ? 64 : 32, dst;
++	u64 M = w ? ~0ull : 0xffffffffull, src = 0, v, res = 0, msb = 1ull << (bits - 1);
++	u32 fl = 0, fm = 0;
++
++	if (d->map == 3) { if (d->opc == 0xF0 && d->pp == 3) op = RORX; else return 0; }
++	else switch (d->opc) {
++	case 0xF2: if (d->pp) return 0; op = ANDN; break;
++	case 0xF3: if (d->pp || ext < 1 || ext > 3) return 0; op = BLSR + ext - 1; break;
++	case 0xF5: op = d->pp == 0 ? BZHI : d->pp == 2 ? PEXT : d->pp == 3 ? PDEP : -1; if (op < 0) return 0; break;
++	case 0xF6: if (d->pp != 3) return 0; op = MULX; break;
++	case 0xF7: op = d->pp == 0 ? BEXTR : d->pp == 1 ? SHLX : d->pp == 2 ? SARX : SHRX; break;
++	default: return 0;
++	}
++	v = c->gpr[d->vvvv] & M;
++	if (d->mod == 3) src = c->gpr[d->rm] & M;
++	else if (mem_rd(c, d->ea, &src, w ? 8 : 4)) return FAULT;
++	dst = d->reg;
++	switch (op) {
++	case ANDN:   res = ~v & src & M; fm = F_CF|F_ZF|F_SF|F_OF; fl = (res ? 0 : F_ZF) | (res & msb ? F_SF : 0); break;
++	case BLSR:   dst = d->vvvv; res = src & (src - 1) & M; fm = F_CF|F_ZF|F_SF|F_OF;
++		     fl = (src ? 0 : F_CF) | (res ? 0 : F_ZF) | (res & msb ? F_SF : 0); break;
++	case BLSI:   dst = d->vvvv; res = src & (0 - src) & M; fm = F_CF|F_ZF|F_SF|F_OF;
++		     fl = (src ? F_CF : 0) | (res ? 0 : F_ZF) | (res & msb ? F_SF : 0); break;
++	case BLSMSK: dst = d->vvvv; res = (src ^ (src - 1)) & M; fm = F_CF|F_ZF|F_SF|F_OF;
++		     fl = (src ? 0 : F_CF) | (res & msb ? F_SF : 0); break;
++	case BEXTR: {
++		unsigned st = v & 0xff, ln = (v >> 8) & 0xff;
++
++		res = st >= (unsigned)bits ? 0 : src >> st;
++		if (ln < (unsigned)bits) res &= (1ull << ln) - 1;
++		fm = F_CF|F_ZF|F_OF; fl = res ? 0 : F_ZF; break;
++	}
++	case BZHI: {
++		unsigned ix = v & 0xff;
++
++		res = src;
++		if (ix < (unsigned)bits) res &= (1ull << ix) - 1;
++		fm = F_CF|F_ZF|F_SF|F_OF;
++		fl = (ix > (unsigned)bits - 1 ? F_CF : 0) | (res ? 0 : F_ZF) | (res & msb ? F_SF : 0); break;
++	}
++	case SHLX: res = (src << (v & (bits - 1))) & M; break;
++	case SHRX: res = src >> (v & (bits - 1)); break;
++	case SARX: res = w ? (u64)((s64)src >> (v & 63)) : (u64)(u32)((s32)src >> (v & 31)); break;
++	case RORX: {
++		unsigned r = d->imm & (bits - 1);
++
++		res = r ? ((src >> r) | (src << (bits - r))) & M : src; break;
++	}
++	case PDEP: { u64 mk = src, b; for (b = 1; mk; mk &= mk - 1, b <<= 1) if (v & b) res |= mk & (0 - mk); break; }
++	case PEXT: { u64 mk = src, b; for (b = 1; mk; mk &= mk - 1, b <<= 1) if (v & (mk & (0 - mk))) res |= b; break; }
++	case MULX: {
++		u64 dx = c->gpr[2] & M, lo, hi;
++
++		if (w) { avx_u128 p = (avx_u128)dx * src; lo = (u64)p; hi = (u64)(p >> 64); }
++		else   { u64 p = dx * src; lo = p & 0xffffffffu; hi = p >> 32; }
++		c->gpr[d->vvvv] = lo; c->gpr[d->reg] = hi;     /* same reg -> high half wins */
++		return 1;
++	}
++	}
++	c->gpr[dst] = res & M;
++	c->rflags = (c->rflags & ~(u64)fm) | fl;
++	return 1;
++}
++
++
++/* ------------------------------------------------------------- GFNI */
++static u8 gf_mul(u8 a, u8 b)        /* GF(2^8) mod x^8+x^4+x^3+x+1 (0x11B) */
++{
++	u8 p = 0;
++	int i;
++
++	for (i = 0; i < 8; i++) {
++		if (b & 1) p ^= a;
++		b >>= 1;
++		a = (a << 1) ^ ((a & 0x80) ? 0x1B : 0);
++	}
++	return p;
++}
++static u8 gf_inv(u8 x)              /* x^254; inv(0) = 0 */
++{
++	u8 r = 1, p = x;
++	int i;
++
++	for (i = 0; i < 7; i++) { p = gf_mul(p, p); r = gf_mul(r, p); }
++	return r;
++}
++static u8 gf_affine(u64 A, u8 x, u8 imm)
++{
++	u8 r = 0, row;
++	int i;
++
++	for (i = 0; i < 8; i++) {
++		row = (A >> (8 * (7 - i))) & 0xff;
++		r |= (u8)((__builtin_parity(row & x) ^ ((imm >> i) & 1)) << i);
++	}
++	return r;
++}
++/* op: 0 mulb, 1 affine, 2 affine-inverse.  a = data bytes (src1), b = matrix qwords (src2). */
++static void gfni_lane(int op, u8 imm, const lane_t *a, const lane_t *b, lane_t *r)
++{
++	int i, j;
++
++	if (op == 0) { FOR(16) r->b[i] = gf_mul(a->b[i], b->b[i]); return; }
++	for (j = 0; j < 2; j++)
++		for (i = 0; i < 8; i++) {
++			u8 x = a->b[8 * j + i];
++
++			r->b[8 * j + i] = gf_affine(b->q[j], op == 2 ? gf_inv(x) : x, imm);
++		}
++}
++
++/* --------------------------------------------------------- AVX-VNNI */
++static int emu_vnni(emu_cpu *c, const insn_t *d)
++{
++	u8 A[32], B[32], R[32];
++	int vb = d->L ? 32 : 16, i, k, sat = d->opc & 1, wss = d->opc >= 0x52;
++
++	if (d->W) return 0;
++	memcpy(A, c->ymm[d->vvvv], 32);
++	RDRM(B, vb);
++	memcpy(R, c->ymm[d->reg], 32);
++	for (i = 0; i < vb / 4; i++) {
++		u32 acc;
++		s64 sum;
++
++		memcpy(&acc, R + 4 * i, 4);
++		sum = (s32)acc;
++		if (!wss) {         /* unsigned bytes of src1 (vvvv) x signed bytes of src2 (r/m) */
++			for (k = 0; k < 4; k++) sum += (s64)A[4 * i + k] * (s8)B[4 * i + k];
++		} else {            /* signed words x signed words */
++			for (k = 0; k < 2; k++) {
++				s16 x, y;
++
++				memcpy(&x, A + 4 * i + 2 * k, 2); memcpy(&y, B + 4 * i + 2 * k, 2);
++				sum += (s64)x * y;
++			}
++		}
++		if (sat) sum = sum > 0x7fffffffLL ? 0x7fffffffLL : sum < -0x80000000LL ? -0x80000000LL : sum;
++		acc = (u32)sum;
++		memcpy(R + 4 * i, &acc, 4);
++	}
++	wr_v(c, d->reg, R, vb);
++	return 1;
++}
++
++/* ----------------------------------------------------------- SHA-NI */
++static u32 ror32(u32 x, int n) { return (x >> n) | (x << (32 - n)); }
++static u32 rol32(u32 x, int n) { return (x << n) | (x >> (32 - n)); }
++
++static void sha1rnds4(const lane_t *s1, const lane_t *s2, unsigned fn, lane_t *r)
++{
++	static const u32 K[4] = { 0x5A827999, 0x6ED9EBA1, 0x8F1BBCDC, 0xCA62C1D6 };
++	u32 A = s1->d[3], B = s1->d[2], C = s1->d[1], D = s1->d[0], E = 0;
++	u32 W[4] = { s2->d[3], s2->d[2], s2->d[1], s2->d[0] };
++	int i;
++
++	fn &= 3;
++	for (i = 0; i < 4; i++) {
++		u32 f = fn == 0 ? ((B & C) ^ (~B & D)) : fn == 2 ? ((B & C) ^ (B & D) ^ (C & D)) : (B ^ C ^ D);
++		u32 t = f + rol32(A, 5) + W[i] + E + K[fn];
++
++		E = D; D = C; C = rol32(B, 30); B = A; A = t;
++	}
++	r->d[3] = A; r->d[2] = B; r->d[1] = C; r->d[0] = D;
++}
++static u32 sig0(u32 x) { return ror32(x, 7) ^ ror32(x, 18) ^ (x >> 3); }
++static u32 sig1(u32 x) { return ror32(x, 17) ^ ror32(x, 19) ^ (x >> 10); }
++static void sha256rnds2(const lane_t *s1, const lane_t *s2, const lane_t *wk, lane_t *r)
++{
++	u32 A = s2->d[3], B = s2->d[2], E = s2->d[1], F = s2->d[0];
++	u32 C = s1->d[3], D = s1->d[2], G = s1->d[1], H = s1->d[0];
++	int i;
++
++	for (i = 0; i < 2; i++) {
++		u32 ch = (E & F) ^ (~E & G), maj = (A & B) ^ (A & C) ^ (B & C);
++		u32 t1 = ch + (ror32(E, 6) ^ ror32(E, 11) ^ ror32(E, 25)) + wk->d[i] + H;
++		u32 nA = t1 + maj + (ror32(A, 2) ^ ror32(A, 13) ^ ror32(A, 22)), nE = t1 + D;
++
++		H = G; G = F; F = E; E = nE; D = C; C = B; B = A; A = nA;
++	}
++	r->d[3] = A; r->d[2] = B; r->d[1] = E; r->d[0] = F;
++}
++/* map 2 opcodes C8..CD, map 3 opcode CC (imm8 = function select) */
++static void sha_op(int map, u8 opc, u8 imm, const lane_t *s1, const lane_t *s2, const lane_t *xmm0, lane_t *r)
++{
++	if (map == 3) { sha1rnds4(s1, s2, imm, r); return; }
++	switch (opc) {
++	case 0xC8: *r = *s2; r->d[3] = s2->d[3] + rol32(s1->d[3], 30); break;           /* sha1nexte */
++	case 0xC9: r->d[3] = s1->d[1] ^ s1->d[3]; r->d[2] = s1->d[0] ^ s1->d[2];       /* sha1msg1  */
++		   r->d[1] = s2->d[3] ^ s1->d[1]; r->d[0] = s2->d[2] ^ s1->d[0]; break;
++	case 0xCA: r->d[3] = rol32(s1->d[3] ^ s2->d[2], 1);                              /* sha1msg2  */
++		   r->d[2] = rol32(s1->d[2] ^ s2->d[1], 1);
++		   r->d[1] = rol32(s1->d[1] ^ s2->d[0], 1);
++		   r->d[0] = rol32(s1->d[0] ^ r->d[3], 1); break;
++	case 0xCB: sha256rnds2(s1, s2, xmm0, r); break;
++	case 0xCC: r->d[3] = s1->d[3] + sig0(s2->d[0]); r->d[2] = s1->d[2] + sig0(s1->d[3]);  /* sha256msg1 */
++		   r->d[1] = s1->d[1] + sig0(s1->d[2]); r->d[0] = s1->d[0] + sig0(s1->d[1]); break;
++	default:   r->d[0] = s1->d[0] + sig1(s2->d[2]); r->d[1] = s1->d[1] + sig1(s2->d[3]);  /* sha256msg2 */
++		   r->d[2] = s1->d[2] + sig1(r->d[0]); r->d[3] = s1->d[3] + sig1(r->d[1]); break;
++	}
++}
++
++/* ------------------------------------------------------- VEX map 1 */
++static int emu_map1(emu_cpu *c, const insn_t *d)
++{
++	u8 o = d->opc, A[32], B[32], R[32];
++	int vb = d->L ? 32 : 16, nl = d->L ? 2 : 1, l, i;
++	lane_t t;
++
++	memset(R, 0, 32);
++	if (d->pp == 1 && o == 0xD7) {                         /* vpmovmskb */
++		u32 m = 0;
++
++		if (d->mod != 3) return 0;
++		for (i = 0; i < 16 * nl; i++) m |= (u32)(c->ymm[d->rm][i] >> 7) << i;
++		c->gpr[d->reg] = m; return 1;
++	}
++	if (d->pp == 1 && (o == 0xD1 || o == 0xD2 || o == 0xD3 || o == 0xE1 || o == 0xE2 ||
++			   o == 0xF1 || o == 0xF2 || o == 0xF3)) {   /* shift by xmm count */
++		int op = o == 0xD1 ? SH_SRLW : o == 0xD2 ? SH_SRLD : o == 0xD3 ? SH_SRLQ : o == 0xE1 ? SH_SRAW :
++			 o == 0xE2 ? SH_SRAD : o == 0xF1 ? SH_SLLW : o == 0xF2 ? SH_SLLD : SH_SLLQ;
++		u64 cnt;
++
++		memcpy(A, c->ymm[d->vvvv], 32);
++		RDRM(B, 16);
++		memcpy(&cnt, B, 8);
++		for (l = 0; l < nl; l++) { memcpy(&t, A + 16 * l, 16); lane_shift(op, &t, cnt, (lane_t *)(R + 16 * l)); }
++		wr_v(c, d->reg, R, vb); return 1;
++	}
++	if (d->pp == 1 && o >= 0x71 && o <= 0x73) {            /* shift by imm8 */
++		int key = (o << 4) | (d->reg & 7), op;
++
++		if (d->mod != 3) return 0;
++		switch (key) {
++		case 0x712: op = SH_SRLW; break; case 0x714: op = SH_SRAW; break; case 0x716: op = SH_SLLW; break;
++		case 0x722: op = SH_SRLD; break; case 0x724: op = SH_SRAD; break; case 0x726: op = SH_SLLD; break;
++		case 0x732: op = SH_SRLQ; break; case 0x733: op = SH_SRLDQ; break;
++		case 0x736: op = SH_SLLQ; break; case 0x737: op = SH_SLLDQ; break;
++		default: return 0;
++		}
++		memcpy(A, c->ymm[d->rm], 32);
++		for (l = 0; l < nl; l++) { memcpy(&t, A + 16 * l, 16); lane_shift(op, &t, d->imm, (lane_t *)(R + 16 * l)); }
++		wr_v(c, d->vvvv, R, vb); return 1;
++	}
++	if (o == 0x70 && d->pp >= 1) {                         /* vpshufd / hw / lw */
++		RDRM(A, vb);
++		for (l = 0; l < nl; l++) {
++			const u8 *s = A + 16 * l; u8 *r = R + 16 * l; unsigned im = d->imm;
++
++			if (d->pp == 1) { for (i = 0; i < 4; i++) memcpy(r + 4 * i, s + 4 * ((im >> (2 * i)) & 3), 4); }
++			else if (d->pp == 2) { memcpy(r, s, 8); for (i = 0; i < 4; i++) memcpy(r + 8 + 2 * i, s + 8 + 2 * ((im >> (2 * i)) & 3), 2); }
++			else { memcpy(r + 8, s + 8, 8); for (i = 0; i < 4; i++) memcpy(r + 2 * i, s + 2 * ((im >> (2 * i)) & 3), 2); }
++		}
++		wr_v(c, d->reg, R, vb); return 1;
++	}
++	{ lane_t z, y; memset(&z, 0, sizeof z); if (!lane_op(d, &z, &z, &y)) return 0; }
++	memcpy(A, c->ymm[d->vvvv], 32); RDRM(B, vb);
++	for (l = 0; l < nl; l++) lane_op(d, (lane_t *)(A + 16 * l), (lane_t *)(B + 16 * l), (lane_t *)(R + 16 * l));
++	wr_v(c, d->reg, R, vb); return 1;
++}
++
++/* ------------------------------------------------------- VEX map 2 */
++static int emu_map2(emu_cpu *c, const insn_t *d)
++{
++	u8 o = d->opc, A[32], B[32], R[32];
++	int vb = d->L ? 32 : 16, nl = d->L ? 2 : 1, l, i;
++
++	memset(R, 0, 32);
++	if (o >= 0xF2 && o <= 0xF7) return emu_bmi(c, d);
++	if (d->pp != 1) return 0;
++	if ((o >= 0x96 && o <= 0x9F) || (o >= 0xA6 && o <= 0xAF) || (o >= 0xB6 && o <= 0xBF))
++		return emu_fma(c, d);
++	if (o >= 0x50 && o <= 0x53)
++		return emu_vnni(c, d);
++	switch (o) {
++	case 0xCF:                                             /* vgf2p8mulb */
++		if (d->W) return 0;
++		memcpy(A, c->ymm[d->vvvv], 32); RDRM(B, vb);
++		for (l = 0; l < nl; l++) gfni_lane(0, 0, (lane_t *)(A + 16 * l), (lane_t *)(B + 16 * l), (lane_t *)(R + 16 * l));
++		wr_v(c, d->reg, R, vb); return 1;
++	case 0x13: {                                           /* vcvtph2ps */
++		int n = d->L ? 8 : 4;
++		u32 fl = 0;
++
++		RDRM(A, n * 2);
++		for (i = 0; i < n; i++) {
++			u16 h; u32 f;
++
++			memcpy(&h, A + 2 * i, 2);
++			if ((h & 0x7c00) == 0x7c00 && (h & 0x3ff) && !(h & 0x200)) fl |= AVX_FL_IE;
++			f = h2f(h); memcpy(R + 4 * i, &f, 4);
++		}
++		c->mxcsr |= fl;
++		wr_v(c, d->reg, R, vb); return 1;
++	}
++	case 0x16: case 0x36:                                  /* vpermps / vpermd */
++		if (!d->L) return 0;
++		memcpy(A, c->ymm[d->vvvv], 32); RDRM(B, 32);
++		for (i = 0; i < 8; i++) { u32 ix; memcpy(&ix, A + 4 * i, 4); memcpy(R + 4 * i, B + 4 * (ix & 7), 4); }
++		wr_v(c, d->reg, R, 32); return 1;
++	case 0x5A:                                             /* vbroadcasti128 */
++		if (d->mod == 3 || !d->L) return 0;
++		if (mem_rd(c, d->ea, R, 16)) return FAULT;
++		memcpy(R + 16, R, 16);
++		wr_v(c, d->reg, R, 32); return 1;
++	case 0x18: case 0x19: case 0x58: case 0x59: case 0x78: case 0x79: {
++		int esz = (o == 0x18 || o == 0x58) ? 4 : (o == 0x19 || o == 0x59) ? 8 : o == 0x78 ? 1 : 2;
++
++		RDRM(A, esz);
++		for (i = 0; i < vb / esz; i++) memcpy(R + i * esz, A, esz);
++		wr_v(c, d->reg, R, vb); return 1;
++	}
++	case 0x20: case 0x21: case 0x22: case 0x23: case 0x24: case 0x25:
++	case 0x30: case 0x31: case 0x32: case 0x33: case 0x34: case 0x35: {
++		static const u8 se[6] = {1, 1, 1, 2, 2, 4}, de[6] = {2, 4, 8, 4, 8, 8};
++		int k = o & 15, sx = o < 0x30, n;
++
++		if (k > 5) return 0;
++		n = vb / de[k];
++		RDRM(A, n * se[k]);
++		for (i = 0; i < n; i++) {
++			s64 v;
++
++			if (sx) {
++				switch (se[k]) {
++				case 1: v = (s8)A[i]; break;
++				case 2: { s16 t; memcpy(&t, A + 2 * i, 2); v = t; break; }
++				default: { s32 t; memcpy(&t, A + 4 * i, 4); v = t; }
++				}
++			} else {
++				u64 u = 0; memcpy(&u, A + i * se[k], se[k]); v = (s64)u;
++			}
++			memcpy(R + i * de[k], &v, de[k]);
++		}
++		wr_v(c, d->reg, R, vb); return 1;
++	}
++	case 0x45: case 0x46: case 0x47: {                     /* vpsrlv / vpsravd / vpsllv */
++		int esz = d->W ? 8 : 4, bits = esz * 8;
++
++		if (o == 0x46 && d->W) return 0;
++		memcpy(A, c->ymm[d->vvvv], 32); RDRM(B, vb);
++		for (i = 0; i < vb / esz; i++) {
++			u64 v = 0, cn = 0, r;
++
++			memcpy(&v, A + i * esz, esz); memcpy(&cn, B + i * esz, esz);
++			if (o == 0x46) r = cn >= (u64)bits ? ((v >> (bits - 1)) & 1 ? ~0ull : 0) : (u64)((s64)(s32)v >> cn);
++			else if (cn >= (u64)bits) r = 0;
++			else r = o == 0x45 ? v >> cn : v << cn;
++			memcpy(R + i * esz, &r, esz);
++		}
++		wr_v(c, d->reg, R, vb); return 1;
++	}
++	case 0x8C: case 0x8E: {                                /* vpmaskmovd/q */
++		int esz = d->W ? 8 : 4;
++
++		if (d->mod == 3) return 0;
++		memcpy(A, c->ymm[d->vvvv], 32);
++		for (i = 0; i < vb / esz; i++) {
++			if (!(A[i * esz + esz - 1] & 0x80)) continue;
++			if (o == 0x8C) { if (mem_rd(c, d->ea + i * esz, R + i * esz, esz)) return FAULT; }
++			else if (mem_wr(c, d->ea + i * esz, c->ymm[d->reg] + i * esz, esz)) return FAULT;
++		}
++		if (o == 0x8C) wr_v(c, d->reg, R, vb);
++		return 1;
++	}
++	}
++	{ lane_t z, y; memset(&z, 0, sizeof z); if (!lane_op(d, &z, &z, &y)) return 0; }
++	memcpy(A, c->ymm[d->vvvv], 32); RDRM(B, vb);
++	for (l = 0; l < nl; l++) lane_op(d, (lane_t *)(A + 16 * l), (lane_t *)(B + 16 * l), (lane_t *)(R + 16 * l));
++	wr_v(c, d->reg, R, vb); return 1;
++}
++
++/* ------------------------------------------------------- VEX map 3 */
++static int emu_map3(emu_cpu *c, const insn_t *d)
++{
++	u8 o = d->opc, A[32], B[32], R[32];
++	int vb = d->L ? 32 : 16, nl = d->L ? 2 : 1, l, i;
++	unsigned im = d->imm;
++
++	memset(R, 0, 32);
++	if (o == 0xF0) return emu_bmi(c, d);
++	if (d->pp != 1) return 0;
++	switch (o) {
++	case 0xCE: case 0xCF:                                  /* vgf2p8affineqb / vgf2p8affineinvqb */
++		if (!d->W) return 0;
++		memcpy(A, c->ymm[d->vvvv], 32); RDRM(B, vb);
++		for (l = 0; l < nl; l++)
++			gfni_lane(o == 0xCE ? 1 : 2, im, (lane_t *)(A + 16 * l), (lane_t *)(B + 16 * l), (lane_t *)(R + 16 * l));
++		wr_v(c, d->reg, R, vb); return 1;
++	case 0x00: case 0x01:                                  /* vpermq / vpermpd */
++		if (!d->L || !d->W) return 0;
++		RDRM(A, 32);
++		for (i = 0; i < 4; i++) memcpy(R + 8 * i, A + 8 * ((im >> (2 * i)) & 3), 8);
++		wr_v(c, d->reg, R, 32); return 1;
++	case 0x02:                                             /* vpblendd */
++		memcpy(A, c->ymm[d->vvvv], 32); RDRM(B, vb);
++		for (i = 0; i < vb / 4; i++) memcpy(R + 4 * i, ((im >> i) & 1 ? B : A) + 4 * i, 4);
++		wr_v(c, d->reg, R, vb); return 1;
++	case 0x0E:                                             /* vpblendw */
++		memcpy(A, c->ymm[d->vvvv], 32); RDRM(B, vb);
++		for (i = 0; i < vb / 2; i++) memcpy(R + 2 * i, ((im >> (i & 7)) & 1 ? B : A) + 2 * i, 2);
++		wr_v(c, d->reg, R, vb); return 1;
++	case 0x0F:                                             /* vpalignr */
++		memcpy(A, c->ymm[d->vvvv], 32); RDRM(B, vb);
++		for (l = 0; l < nl; l++) {
++			u8 t[32];
++
++			memcpy(t, B + 16 * l, 16); memcpy(t + 16, A + 16 * l, 16);
++			for (i = 0; i < 16; i++) R[16 * l + i] = (i + (int)im < 32) ? t[i + im] : 0;
++		}
++		wr_v(c, d->reg, R, vb); return 1;
++	case 0x4C: {                                           /* vpblendvb */
++		const u8 *sel = c->ymm[im >> 4];
++
++		memcpy(A, c->ymm[d->vvvv], 32); RDRM(B, vb);
++		for (i = 0; i < vb; i++) R[i] = (sel[i] & 0x80) ? B[i] : A[i];
++		wr_v(c, d->reg, R, vb); return 1;
++	}
++	case 0x38:                                             /* vinserti128 */
++		if (!d->L) return 0;
++		memcpy(R, c->ymm[d->vvvv], 32); RDRM(B, 16);
++		memcpy(R + 16 * (im & 1), B, 16);
++		wr_v(c, d->reg, R, 32); return 1;
++	case 0x39:                                             /* vextracti128 */
++		if (!d->L) return 0;
++		if (d->mod == 3) wr_v(c, d->rm, c->ymm[d->reg] + 16 * (im & 1), 16);
++		else if (mem_wr(c, d->ea, c->ymm[d->reg] + 16 * (im & 1), 16)) return FAULT;
++		return 1;
++	case 0x46:                                             /* vperm2i128 */
++		if (!d->L) return 0;
++		memcpy(A, c->ymm[d->vvvv], 32); RDRM(B, 32);
++		for (i = 0; i < 2; i++) {
++			unsigned s = (im >> (4 * i)) & 15;
++
++			if (!(s & 8)) memcpy(R + 16 * i, ((s & 2) ? B : A) + 16 * (s & 1), 16);
++		}
++		wr_v(c, d->reg, R, 32); return 1;
++	case 0x1D: {                                           /* vcvtps2ph */
++		int n = d->L ? 8 : 4, rm = (im & 4) ? (int)((c->mxcsr >> 13) & 3) : (int)(im & 3);
++		u32 fl = 0;
++
++		if (d->W) return 0;
++		for (i = 0; i < n; i++) {
++			u32 f; u16 h;
++
++			memcpy(&f, c->ymm[d->reg] + 4 * i, 4);
++			h = f2h(f, rm, &fl); memcpy(R + 2 * i, &h, 2);
++		}
++		if (d->mod == 3) wr_v(c, d->rm, R, 16);
++		else if (mem_wr(c, d->ea, R, n * 2)) return FAULT;
++		c->mxcsr |= fl;
++		return 1;
++	}
++	}
++	return 0;
++}
++
++/* ------------------------------------------------------------ decode */
++static unsigned need_for(const insn_t *d)
++{
++	u8 o = d->opc;
++
++	if (d->map == 2) {
++		if ((o >= 0x96 && o <= 0x9F) || (o >= 0xA6 && o <= 0xAF) || (o >= 0xB6 && o <= 0xBF)) return AVXEMU_F_FMA;
++		if (o == 0xF2 || o == 0xF3 || (o == 0xF7 && d->pp == 0)) return AVXEMU_F_BMI1;
++		if (o == 0xF5 || o == 0xF6 || o == 0xF7) return AVXEMU_F_BMI2;
++		if (o == 0x13) return AVXEMU_F_F16C;
++		if (o == 0xCF) return AVXEMU_F_GFNI;
++		if (o >= 0x50 && o <= 0x53) return AVXEMU_F_AVXVNNI;
++	} else if (d->map == 3) {
++		if (o == 0xF0) return AVXEMU_F_BMI2;
++		if (o == 0x1D) return AVXEMU_F_F16C;
++		if (o == 0xCE || o == 0xCF) return AVXEMU_F_GFNI;
++	}
++	return AVXEMU_F_AVX2;
++}
++
++static int emu_vex(emu_cpu *c, const u8 *p, int n, int seg)
++{
++	insn_t d;
++	modrm_t m;
++	int R, X, B, imm, ok;
++
++	memset(&d, 0, sizeof d);
++	if (p[n] == 0xC5) {
++		u8 b1 = p[n + 1];
++
++		R = !(b1 >> 7); X = B = 0; d.map = 1; d.W = 0;
++		d.vvvv = (~b1 >> 3) & 15; d.L = (b1 >> 2) & 1; d.pp = b1 & 3; n += 2;
++	} else {
++		u8 b1 = p[n + 1], b2 = p[n + 2];
++
++		R = !(b1 & 0x80); X = !(b1 & 0x40); B = !(b1 & 0x20); d.map = b1 & 0x1f;
++		d.W = b2 >> 7; d.vvvv = (~b2 >> 3) & 15; d.L = (b2 >> 2) & 1; d.pp = b2 & 3; n += 3;
++	}
++	if (d.map < 1 || d.map > 3) return 0;
++	d.opc = p[n++];
++	if (c->host_has & need_for(&d)) return 0;      /* CPU has it: this #UD is not ours */
++	parse_modrm(p + n, R, X, B, &m); n += m.len;
++	d.mod = m.mod; d.reg = m.reg; d.rm = m.rm;
++	imm = d.map == 3 || (d.map == 1 && d.opc >= 0x70 && d.opc <= 0x73);
++	if (imm) d.imm = p[n++];
++	d.len = n;
++	if (n > 15) return 0;
++	if (m.mod != 3) {
++		d.ea = calc_ea(c, &m, c->rip + n);
++		if (seg) { if (!c->seg_base) return 0; d.ea += c->seg_base(c, seg == 1); }
++	}
++	ok = d.map == 1 ? emu_map1(c, &d) : d.map == 2 ? emu_map2(c, &d) : emu_map3(c, &d);
++	return ok < 0 ? ok : ok ? d.len : 0;
++}
++
++static int emu_movbe(emu_cpu *c, const u8 *p, int n, int p66, int rex, int seg)
++{
++	modrm_t m;
++	int store = p[n + 2] == 0xF1, sz;
++	u64 ea, v = 0;
++
++	if (c->host_has & AVXEMU_F_MOVBE) return 0;
++	n += 3;
++	parse_modrm(p + n, (rex >> 2) & 1, (rex >> 1) & 1, rex & 1, &m);
++	if (m.mod == 3) return 0;
++	n += m.len;
++	if (n > 15) return 0;
++	ea = calc_ea(c, &m, c->rip + n);
++	if (seg) { if (!c->seg_base) return 0; ea += c->seg_base(c, seg == 1); }
++	sz = (rex & 8) ? 8 : p66 ? 2 : 4;
++	if (store) {
++		v = c->gpr[m.reg];
++		v = sz == 8 ? __builtin_bswap64(v) : sz == 4 ? __builtin_bswap32((u32)v) : __builtin_bswap16((u16)v);
++		if (mem_wr(c, ea, &v, sz)) return FAULT;
++	} else {
++		if (mem_rd(c, ea, &v, sz)) return FAULT;
++		if (sz == 8) c->gpr[m.reg] = __builtin_bswap64(v);
++		else if (sz == 4) c->gpr[m.reg] = __builtin_bswap32((u32)v);
++		else c->gpr[m.reg] = (c->gpr[m.reg] & ~0xffffull) | __builtin_bswap16((u16)v);
++	}
++	return n;
++}
++
++
++/* Legacy (non-VEX) SSE encodings: SHA-NI and GFNI.  XMM operands only; a memory operand must be
++ * 16-byte aligned (#GP otherwise); only bits 127:0 of the destination are written. */
++static int emu_legacy_sse(emu_cpu *c, const u8 *p, int n, int p66, int rex, int seg, int map, u8 opc)
++{
++	modrm_t m;
++	lane_t a, b, w0, r;
++	u8 imm = 0;
++	u32 need;
++	u64 ea;
++	int gfni;
++
++	if (map == 2) {
++		if (opc >= 0xC8 && opc <= 0xCD) { if (p66) return 0; need = AVXEMU_F_SHA; gfni = 0; }
++		else if (opc == 0xCF) { if (!p66) return 0; need = AVXEMU_F_GFNI; gfni = 1; }
++		else return 0;
++	} else {
++		if (opc == 0xCC) { if (p66) return 0; need = AVXEMU_F_SHA; gfni = 0; }
++		else if (opc == 0xCE || opc == 0xCF) { if (!p66) return 0; need = AVXEMU_F_GFNI; gfni = 1; }
++		else return 0;
++	}
++	if (c->host_has & need) return 0;
++	n += 3;
++	parse_modrm(p + n, (rex >> 2) & 1, (rex >> 1) & 1, rex & 1, &m);
++	n += m.len;
++	if (map == 3) imm = p[n++];
++	if (n > 15) return 0;
++	memcpy(&a, c->ymm[m.reg], 16);
++	if (m.mod == 3) {
++		memcpy(&b, c->ymm[m.rm], 16);
++	} else {
++		ea = calc_ea(c, &m, c->rip + n);
++		if (seg) { if (!c->seg_base) return 0; ea += c->seg_base(c, seg == 1); }
++		if (ea & 15) return AVXEMU_GP;
++		if (mem_rd(c, ea, &b, 16)) return FAULT;
++	}
++	memset(&r, 0, sizeof r);
++	if (gfni) {
++		gfni_lane(map == 2 ? 0 : opc == 0xCE ? 1 : 2, imm, &a, &b, &r);
++	} else {
++		memcpy(&w0, c->ymm[0], 16);
++		sha_op(map, opc, imm, &a, &b, &w0, &r);
++	}
++	memcpy(c->ymm[m.reg], &r, 16);                    /* legacy SSE: upper YMM half preserved */
++	return n;
++}
++
++int avxemu_step(struct avxemu_cpu *c, const u8 *p)
++{
++	int n = 0, seg = 0, p66 = 0, rex = 0;
++
++	for (;; n++) {
++		u8 b = p[n];
++
++		if (b == 0x64) seg = 1; else if (b == 0x65) seg = 2;
++		else if (b == 0x2e || b == 0x36 || b == 0x3e || b == 0x26) ;
++		else if (b == 0x66) p66 = 1;
++		else break;
++		if (n >= 10) return 0;
++	}
++	if (p[n] == 0xC4 || p[n] == 0xC5) return p66 ? 0 : emu_vex(c, p, n, seg);
++	if ((p[n] & 0xF0) == 0x40) rex = p[n++];
++	if (p[n] == 0x0F && p[n + 1] == 0x38 && (p[n + 2] == 0xF0 || p[n + 2] == 0xF1))
++		return emu_movbe(c, p, n, p66, rex, seg);
++	if (p[n] == 0x0F && (p[n + 1] == 0x38 || p[n + 1] == 0x3A))
++		return emu_legacy_sse(c, p, n, p66, rex, seg, p[n + 1] == 0x38 ? 2 : 3, p[n + 2]);
++	return 0;
++}
+diff -urN a/arch/x86/kernel/fpu/avxemu/avxemu_core.h b/arch/x86/kernel/fpu/avxemu/avxemu_core.h
+--- a/arch/x86/kernel/fpu/avxemu/avxemu_core.h	1970-01-01 00:00:00.000000000 +0000
++++ b/arch/x86/kernel/fpu/avxemu/avxemu_core.h	2026-11-01 20:47:32.428884017 +0000
+@@ -0,0 +1,46 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/* Freestanding x86-64 emulator core for post-AVX instructions (AVX2, FMA3, BMI1/2, F16C,
++ * MOVBE) on CPUs that have AVX but lack them.  Scalar integer code only: no SIMD, no libm,
++ * no allocation.  Builds unchanged in userland (tests, LD_PRELOAD handler) and in Linux. */
++#ifndef _AVXEMU_CORE_H
++#define _AVXEMU_CORE_H
++#include "avxemu_types.h"
++
++#define AVXEMU_F_AVX2  0x01u
++#define AVXEMU_F_FMA   0x02u
++#define AVXEMU_F_BMI1  0x04u
++#define AVXEMU_F_BMI2  0x08u
++#define AVXEMU_F_F16C  0x10u
++#define AVXEMU_F_MOVBE 0x20u
++#define AVXEMU_F_GFNI  0x40u	/* VEX- and legacy-encoded GF2P8MULB/AFFINEQB/AFFINEINVQB */
++#define AVXEMU_F_AVXVNNI 0x80u	/* VEX VPDPBUSD[S] / VPDPWSSD[S] */
++#define AVXEMU_F_SHA   0x100u	/* SHA1RNDS4/NEXTE/MSG1/MSG2, SHA256RNDS2/MSG1/MSG2 */
++#define AVXEMU_F_ALL   0x1FFu
++
++#define AVXEMU_FAULT (-1)	/* memory operand not accessible: c->fault_addr */
++#define AVXEMU_GP    (-2)	/* #GP(0): misaligned legacy-SSE 128-bit memory operand */
++
++struct avxemu_cpu {
++	u64 gpr[16];		/* RAX RCX RDX RBX RSP RBP RSI RDI R8..R15            */
++	u64 rip;		/* address of the faulting instruction                 */
++	u64 rflags;		/* only CF PF AF ZF SF OF are ever modified            */
++	u32 mxcsr;		/* RC and sticky flag bits are honoured / updated      */
++	u8  ymm[16][32];	/* [0..15] = XMM, [16..31] = YMM_Hi128                 */
++
++	u32 host_has;		/* AVXEMU_F_* the CPU really has: those insns are not emulated */
++	int (*rd)(struct avxemu_cpu *c, u64 addr, void *dst, unsigned n);       /* 0 = ok */
++	int (*wr)(struct avxemu_cpu *c, u64 addr, const void *src, unsigned n); /* 0 = ok */
++	u64 (*seg_base)(struct avxemu_cpu *c, int fs);	/* NULL: FS/GS-relative operands unsupported */
++	void *priv;
++	u64 fault_addr;		/* out: address that failed when avxemu_step() returns -1 */
++};
++
++/* Decode and execute the instruction in insn[] (at least 32 readable bytes, zero padded;
++ * c->rip is its address, used for RIP-relative operands).  The caller owns commit/rollback:
++ * c is modified only on success.
++ *   > 0  executed, value = instruction length (caller advances RIP)
++ *   = 0  not an instruction we emulate (caller raises SIGILL as usual)
++ *   AVXEMU_FAULT  a memory operand faulted: c->fault_addr; c's register state is unspecified
++ *   AVXEMU_GP     the instruction would raise #GP(0) (caller delivers SIGSEGV) */
++int avxemu_step(struct avxemu_cpu *c, const u8 *insn);
++#endif /* _AVXEMU_CORE_H */
+diff -urN a/arch/x86/kernel/fpu/avxemu/avxemu_fma.c b/arch/x86/kernel/fpu/avxemu/avxemu_fma.c
+--- a/arch/x86/kernel/fpu/avxemu/avxemu_fma.c	1970-01-01 00:00:00.000000000 +0000
++++ b/arch/x86/kernel/fpu/avxemu/avxemu_fma.c	2026-11-01 20:47:32.429070594 +0000
+@@ -0,0 +1,174 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Exact fused multiply-add on IEEE binary32/binary64 using only integer arithmetic.
++ * Product (<=106 bits) and addend are normalised into a 128-bit workspace, aligned with a
++ * sticky bit, added/subtracted, then rounded once.  Tininess is detected after rounding
++ * (x86 semantics).  No FTZ/DAZ handling. */
++#include "avxemu_fma.h"
++
++static int msb128(avx_u128 x)       /* x != 0 */
++{
++	u64 hi = (u64)(x >> 64);
++
++	return hi ? 127 - __builtin_clzll(hi) : 63 - __builtin_clzll((u64)x);
++}
++
++static avx_u128 shr_sticky(avx_u128 x, int n)
++{
++	if (n <= 0)
++		return x;
++	if (n >= 128)
++		return x != 0;
++	return (x >> n) | ((x & (((avx_u128)1 << n) - 1)) != 0);
++}
++
++/* Drop `drop` low bits of r (value r*2^e), producing q plus round/sticky. */
++static u64 round_at(avx_u128 r, int drop, int sign, int rm, int *inexact, int *carry_all_ones)
++{
++	u64 q;
++	int rnd, stk, inc;
++
++	if (drop <= 0) {
++		q = (u64)(r << -drop);
++		rnd = stk = 0;
++	} else if (drop > 128) {
++		q = 0; rnd = 0; stk = 1;
++	} else if (drop == 128) {
++		q = 0; rnd = (int)(r >> 127) & 1; stk = (r & (((avx_u128)1 << 127) - 1)) != 0;
++	} else {
++		q = (u64)(r >> drop);
++		rnd = (int)(r >> (drop - 1)) & 1;
++		stk = (r & (((avx_u128)1 << (drop - 1)) - 1)) != 0;
++	}
++	*inexact = rnd | stk;
++	inc = rm == AVX_RN ? (rnd && (stk || (q & 1))) :
++	      rm == AVX_RD ? (sign && *inexact) :
++	      rm == AVX_RU ? (!sign && *inexact) : 0;
++	*carry_all_ones = inc && (q + 1 == 0);   /* unused sentinel, see caller */
++	return q + inc;
++}
++
++static u64 fma_generic(int ebits, int mbits, u64 a, u64 b, u64 c, int rm, u32 *fl)
++{
++	const int tot = 1 + ebits + mbits, bias = (1 << (ebits - 1)) - 1, emax = (1 << ebits) - 1;
++	const u64 fmask = ((u64)1 << mbits) - 1, emask = (u64)emax;
++	const u64 dnan = ((u64)1 << (tot - 1)) | (emask << mbits) | ((u64)1 << (mbits - 1));
++	int sa = (a >> (tot - 1)) & 1, sb = (b >> (tot - 1)) & 1, sc = (c >> (tot - 1)) & 1;
++	u64 ea = (a >> mbits) & emask, eb = (b >> mbits) & emask, ec = (c >> mbits) & emask;
++	u64 fa = a & fmask, fb = b & fmask, fc = c & fmask;
++	int a_inf = ea == emask, b_inf = eb == emask, c_inf = ec == emask;
++	int a_zero = !ea && !fa, b_zero = !eb && !fb, c_zero = !ec && !fc;
++	int ps = sa ^ sb, s, emin = 1 - bias;
++	avx_u128 P, C, A, B, R;
++	int eP, eC, eR, sh, m, E, lsb, lsb_u, inexact, dummy, tiny;
++	u64 ma, mb, mc, q, bexp;
++
++	if (a_inf || b_inf) {
++		if (a_zero || b_zero || (c_inf && sc != ps)) {
++			*fl |= AVX_FL_IE;
++			return dnan;
++		}
++		return ((u64)ps << (tot - 1)) | (emask << mbits);
++	}
++	if (c_inf)
++		return c;
++	if (a_zero || b_zero) {
++		if (c_zero) {
++			s = ps == sc ? ps : (rm == AVX_RD);
++			return (u64)s << (tot - 1);
++		}
++		return c;
++	}
++
++	ma = ea ? (fa | ((u64)1 << mbits)) : fa;
++	mb = eb ? (fb | ((u64)1 << mbits)) : fb;
++	mc = ec ? (fc | ((u64)1 << mbits)) : fc;
++	eP = (int)(ea ? ea : 1) + (int)(eb ? eb : 1) - 2 * (bias + mbits);
++	eC = (int)(ec ? ec : 1) - bias - mbits;
++
++	P = (avx_u128)ma * mb;
++	sh = 120 - msb128(P);
++	P <<= sh; eP -= sh;
++	if (mc) {
++		sh = 120 - msb128(mc);
++		C = (avx_u128)mc << sh; eC -= sh;
++	} else {
++		C = 0;
++	}
++
++	if (!C) {
++		R = P; eR = eP; s = ps;
++	} else {
++		if (eP >= eC) { A = P; B = shr_sticky(C, eP - eC); eR = eP; }
++		else          { A = shr_sticky(P, eC - eP); B = C; eR = eC; }
++		if (ps == sc) {
++			R = A + B; s = ps;
++		} else if (A > B) {
++			R = A - B; s = ps;
++		} else if (B > A) {
++			R = B - A; s = sc;
++		} else {
++			return (u64)(rm == AVX_RD) << (tot - 1);
++		}
++	}
++
++	m = msb128(R);
++	E = eR + m;
++	lsb_u = E - mbits;
++	lsb = lsb_u > emin - mbits ? lsb_u : emin - mbits;
++	q = round_at(R, lsb - eR, s, rm, &inexact, &dummy);
++	if (q == ((u64)1 << (mbits + 1))) {
++		q >>= 1;
++		lsb++;
++	}
++	if (inexact)
++		*fl |= AVX_FL_PE;
++
++	if (inexact && E < emin) {            /* tininess after rounding */
++		tiny = 1;
++		if (E == emin - 1) {          /* does rounding with unbounded exponent reach 2^emin? */
++			u64 qu = round_at(R, lsb_u - eR, s, rm, &dummy, &dummy);
++
++			if (qu == ((u64)1 << (mbits + 1)))
++				tiny = 0;
++		}
++		if (tiny)
++			*fl |= AVX_FL_UE;
++	}
++
++	if (q >> mbits)
++		bexp = (u64)(lsb + mbits + bias);
++	else
++		bexp = 0;
++	if (bexp >= emask) {
++		*fl |= AVX_FL_OE | AVX_FL_PE;
++		if (rm == AVX_RZ || (rm == AVX_RD && !s) || (rm == AVX_RU && s))
++			return ((u64)s << (tot - 1)) | ((emask - 1) << mbits) | fmask;
++		return ((u64)s << (tot - 1)) | (emask << mbits);
++	}
++	return ((u64)s << (tot - 1)) | (bexp << mbits) | (q & fmask);
++}
++
++/* x86 raises the denormal-operand flag unless the operation is invalid. */
++static u64 fma_flags(int ebits, int mbits, u64 a, u64 b, u64 c, int rm, u32 *fl)
++{
++	const u64 emask = ((u64)1 << ebits) - 1, fmask = ((u64)1 << mbits) - 1;
++	int de = (!((a >> mbits) & emask) && (a & fmask)) || (!((b >> mbits) & emask) && (b & fmask)) ||
++		 (!((c >> mbits) & emask) && (c & fmask));
++	u32 f = 0;
++	u64 r = fma_generic(ebits, mbits, a, b, c, rm, &f);
++
++	if (de && !(f & AVX_FL_IE))
++		f |= AVX_FL_DE;
++	*fl |= f;
++	return r;
++}
++
++u32 avx_fma32(u32 a, u32 b, u32 c, int rm, u32 *fl)
++{
++	return (u32)fma_flags(8, 23, a, b, c, rm, fl);
++}
++
++u64 avx_fma64(u64 a, u64 b, u64 c, int rm, u32 *fl)
++{
++	return fma_flags(11, 52, a, b, c, rm, fl);
++}
+diff -urN a/arch/x86/kernel/fpu/avxemu/avxemu_fma.h b/arch/x86/kernel/fpu/avxemu/avxemu_fma.h
+--- a/arch/x86/kernel/fpu/avxemu/avxemu_fma.h	1970-01-01 00:00:00.000000000 +0000
++++ b/arch/x86/kernel/fpu/avxemu/avxemu_fma.h	2026-11-01 20:47:32.429301042 +0000
+@@ -0,0 +1,23 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _AVXEMU_FMA_H
++#define _AVXEMU_FMA_H
++#include "avxemu_types.h"
++
++/* MXCSR exception-flag bits */
++#define AVX_FL_IE 0x01u
++#define AVX_FL_DE 0x02u
++#define AVX_FL_OE 0x08u
++#define AVX_FL_UE 0x10u
++#define AVX_FL_PE 0x20u
++/* rounding modes, same encoding as MXCSR.RC */
++#define AVX_RN 0
++#define AVX_RD 1
++#define AVX_RU 2
++#define AVX_RZ 3
++
++/* Fused a*b+c with a single rounding.  Inputs must not be NaN (the caller applies
++ * the x86 NaN-operand rules).  Invalid operations return the x86 default QNaN.
++ * OR-s raised exception flags into *fl.  Integer-only: usable in the kernel. */
++u32 avx_fma32(u32 a, u32 b, u32 c, int rm, u32 *fl);
++u64 avx_fma64(u64 a, u64 b, u64 c, int rm, u32 *fl);
++#endif /* _AVXEMU_FMA_H */
+diff -urN a/arch/x86/kernel/fpu/avxemu/avxemu_glue.c b/arch/x86/kernel/fpu/avxemu/avxemu_glue.c
+--- a/arch/x86/kernel/fpu/avxemu/avxemu_glue.c	1970-01-01 00:00:00.000000000 +0000
++++ b/arch/x86/kernel/fpu/avxemu/avxemu_glue.c	2026-11-01 20:47:32.429506477 +0000
+@@ -0,0 +1,277 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * In-kernel emulation of AVX2/FMA3/BMI1/BMI2/F16C/MOVBE for x86-64 CPUs that have AVX but
++ * lack those extensions.  A user-mode #UD is intercepted in handle_invalid_op(); the
++ * instruction is decoded and executed by the freestanding core (avxemu_core.c) on a copy of
++ * the task's registers, then committed.  Anything not recognised falls through to the normal
++ * SIGILL path, so behaviour for genuinely invalid instructions is unchanged.
++ *
++ * Cost per emulated instruction is one exception entry/exit - no signal frame, no XSAVE to
++ * the user stack, no sigreturn.  CPUID is deliberately NOT altered: software that probes
++ * CPUID keeps selecting its non-AVX2 paths; only code that uses the instructions
++ * unconditionally benefits.
++ */
++#define pr_fmt(fmt) "avxemu: " fmt
++
++#include <linux/init.h>
++#include <linux/sched.h>
++#include <linux/sched/signal.h>
++#include <linux/uaccess.h>
++#include <linux/ptrace.h>
++#include <linux/signal.h>
++#include <linux/debugfs.h>
++#include <linux/jump_label.h>
++#include <linux/atomic.h>
++#include <linux/kstrtox.h>
++#include <linux/printk.h>
++
++#include <asm/processor.h>
++#include <asm/cpufeature.h>
++#include <asm/fpu/api.h>
++#include <asm/fpu/xstate.h>
++#include <asm/fpu/sched.h>
++#include <asm/fpu/signal.h>
++#include <asm/insn.h>
++#include <asm/insn-eval.h>
++#include <asm/fsgsbase.h>
++#include <asm/traps.h>
++#include <asm/ptrace.h>
++
++#include "../context.h"
++#include "avxemu_core.h"
++
++#define AVXEMU_ARITH_FLAGS (X86_EFLAGS_CF | X86_EFLAGS_PF | X86_EFLAGS_AF | \
++			    X86_EFLAGS_ZF | X86_EFLAGS_SF | X86_EFLAGS_OF)
++
++static DEFINE_STATIC_KEY_FALSE(avxemu_active);
++static bool avxemu_param = true;
++static u32 avxemu_host_has;
++static atomic_t n_emulated, n_declined, n_fault;
++
++static int __init avxemu_setup(char *str)
++{
++	return kstrtobool(str, &avxemu_param) == 0;
++}
++__setup("avxemu=", avxemu_setup);
++
++/* ---- memory operand access: faults are reported, never oops ---------------------- */
++static int k_rd(struct avxemu_cpu *c, u64 addr, void *dst, unsigned int n)
++{
++	return copy_from_user(dst, (const void __user *)(unsigned long)addr, n) ? -EFAULT : 0;
++}
++
++static int k_wr(struct avxemu_cpu *c, u64 addr, const void *src, unsigned int n)
++{
++	return copy_to_user((void __user *)(unsigned long)addr, src, n) ? -EFAULT : 0;
++}
++
++static u64 k_seg_base(struct avxemu_cpu *c, int fs)
++{
++	return fs ? x86_fsbase_read_task(current) : x86_gsbase_read_task(current);
++}
++
++/* ---- cheap pre-filter so ordinary SIGILLs never touch the FPU --------------------- */
++static bool avxemu_maybe_ours(const u8 *p)
++{
++	int n = 0;
++
++	for (; n < 10; n++) {
++		u8 b = p[n];
++
++		if (b == 0x64 || b == 0x65 || b == 0x66 || b == 0x2e || b == 0x36 || b == 0x3e || b == 0x26)
++			continue;
++		break;
++	}
++	if (p[n] == 0xC4 || p[n] == 0xC5)
++		return true;
++	if ((p[n] & 0xF0) == 0x40)
++		n++;
++	if (p[n] != 0x0F)
++		return false;
++	if (p[n + 1] == 0x38)		/* MOVBE, SHA1/SHA256 (C8-CD), GF2P8MULB */
++		return p[n + 2] == 0xF0 || p[n + 2] == 0xF1 || (p[n + 2] >= 0xC8 && p[n + 2] <= 0xCD) ||
++		       p[n + 2] == 0xCF;
++	if (p[n + 1] == 0x3A)		/* SHA1RNDS4, GF2P8AFFINE[INV]QB */
++		return p[n + 2] == 0xCC || p[n + 2] == 0xCE || p[n + 2] == 0xCF;
++	return false;
++}
++
++/* ---- user FPU/SIMD state <-> core -------------------------------------------------
++ * kernel_fpu_begin() saves the task's live registers into its fpstate buffer and marks
++ * them stale (TIF_NEED_FPU_LOAD), so the buffer is the truth until the next return to user.
++ * After editing it we must also forget any CPU that still holds an older copy
++ * (fpu->last_cpu), otherwise a migrate-away-and-back could skip the reload. */
++static void avxemu_fpu_read(struct avxemu_cpu *c)
++{
++	struct xregs_state *xs;
++	void *ymmh;
++	u64 bv;
++	int i;
++
++	kernel_fpu_begin();
++	xs = &x86_task_fpu(current)->fpstate->regs.xsave;
++	bv = xs->header.xfeatures;
++	c->mxcsr = xs->i387.mxcsr;
++	ymmh = (bv & XFEATURE_MASK_YMM) ? get_xsave_addr(xs, XFEATURE_YMM) : NULL;
++	for (i = 0; i < 16; i++) {
++		if (bv & XFEATURE_MASK_SSE)
++			memcpy(c->ymm[i], &xs->i387.xmm_space[4 * i], 16);
++		else
++			memset(c->ymm[i], 0, 16);
++		if (ymmh)
++			memcpy(c->ymm[i] + 16, (u8 *)ymmh + 16 * i, 16);
++		else
++			memset(c->ymm[i] + 16, 0, 16);
++	}
++	kernel_fpu_end();
++}
++
++static bool avxemu_fpu_write(const struct avxemu_cpu *c)
++{
++	struct fpu *fpu = x86_task_fpu(current);
++	struct xregs_state *xs;
++	void *ymmh;
++	int i;
++
++	kernel_fpu_begin();
++	xs = &fpu->fpstate->regs.xsave;
++	xs->header.xfeatures |= XFEATURE_MASK_SSE | XFEATURE_MASK_YMM;
++	ymmh = get_xsave_addr(xs, XFEATURE_YMM);
++	if (WARN_ON_ONCE(!ymmh)) {
++		kernel_fpu_end();
++		return false;
++	}
++	xs->i387.mxcsr = c->mxcsr;
++	for (i = 0; i < 16; i++) {
++		memcpy(&xs->i387.xmm_space[4 * i], c->ymm[i], 16);
++		memcpy((u8 *)ymmh + 16 * i, c->ymm[i] + 16, 16);
++	}
++	__fpu_invalidate_fpregs_state(fpu);
++	kernel_fpu_end();
++	return true;
++}
++
++static void avxemu_load_regs(struct avxemu_cpu *c, const struct pt_regs *r)
++{
++	c->gpr[0] = r->ax; c->gpr[1] = r->cx; c->gpr[2] = r->dx; c->gpr[3] = r->bx;
++	c->gpr[4] = r->sp; c->gpr[5] = r->bp; c->gpr[6] = r->si; c->gpr[7] = r->di;
++	c->gpr[8] = r->r8; c->gpr[9] = r->r9; c->gpr[10] = r->r10; c->gpr[11] = r->r11;
++	c->gpr[12] = r->r12; c->gpr[13] = r->r13; c->gpr[14] = r->r14; c->gpr[15] = r->r15;
++	c->rip = r->ip;
++	c->rflags = r->flags;
++}
++
++static void avxemu_store_regs(struct pt_regs *r, const struct avxemu_cpu *c)
++{
++	r->ax = c->gpr[0]; r->cx = c->gpr[1]; r->dx = c->gpr[2]; r->bx = c->gpr[3];
++	r->bp = c->gpr[5]; r->si = c->gpr[6]; r->di = c->gpr[7];
++	r->r8 = c->gpr[8]; r->r9 = c->gpr[9]; r->r10 = c->gpr[10]; r->r11 = c->gpr[11];
++	r->r12 = c->gpr[12]; r->r13 = c->gpr[13]; r->r14 = c->gpr[14]; r->r15 = c->gpr[15];
++	r->flags = (r->flags & ~AVXEMU_ARITH_FLAGS) | (c->rflags & AVXEMU_ARITH_FLAGS);
++}
++
++/**
++ * avxemu_handle_ud - try to emulate the instruction that raised a user-mode #UD
++ * @regs: user register state at the fault
++ *
++ * Called from handle_invalid_op() with interrupts disabled (as left by irqentry_enter()).
++ * Returns true if the exception was fully handled (instruction emulated, or SIGSEGV queued
++ * for a bad memory operand); false to continue with the normal SIGILL delivery.
++ */
++bool avxemu_handle_ud(struct pt_regs *regs)
++{
++	struct avxemu_cpu c = {};
++	u8 ibuf[32] = {};
++	bool handled = false;
++	int n, len;
++
++	if (!static_branch_unlikely(&avxemu_active) || !user_64bit_mode(regs))
++		return false;
++
++	local_irq_enable();		/* user mode: IF is set; copy_from_user() may sleep */
++
++	n = insn_fetch_from_user(regs, ibuf);
++	if (n <= 0 || !avxemu_maybe_ours(ibuf))
++		goto out;
++
++	avxemu_load_regs(&c, regs);
++	avxemu_fpu_read(&c);
++	c.host_has = avxemu_host_has;
++	c.rd = k_rd;
++	c.wr = k_wr;
++	c.seg_base = k_seg_base;
++
++	len = avxemu_step(&c, ibuf);
++	if (len == 0) {
++		atomic_inc(&n_declined);
++		goto out;
++	}
++	handled = true;
++	if (len == AVXEMU_GP) {		/* misaligned legacy-SSE operand: what the CPU would do */
++		atomic_inc(&n_fault);
++		force_sig(SIGSEGV);
++		goto out;
++	}
++	if (len < 0) {			/* memory operand not accessible: report it like a #PF would */
++		atomic_inc(&n_fault);
++		force_sig_fault(SIGSEGV, SEGV_MAPERR, (void __user *)(unsigned long)c.fault_addr);
++		goto out;
++	}
++	if (!avxemu_fpu_write(&c)) {
++		handled = false;
++		goto out;
++	}
++	avxemu_store_regs(regs, &c);
++	regs->ip += len;
++	atomic_inc(&n_emulated);
++	if (regs->flags & X86_EFLAGS_TF)
++		user_single_step_report(regs);
++out:
++	local_irq_disable();
++	return handled;
++}
++
++static int __init avxemu_init(void)
++{
++	u32 has = 0;
++
++	if (boot_cpu_has(X86_FEATURE_AVX2))  has |= AVXEMU_F_AVX2;
++	if (boot_cpu_has(X86_FEATURE_FMA))   has |= AVXEMU_F_FMA;
++	if (boot_cpu_has(X86_FEATURE_BMI1))  has |= AVXEMU_F_BMI1;
++	if (boot_cpu_has(X86_FEATURE_BMI2))  has |= AVXEMU_F_BMI2;
++	if (boot_cpu_has(X86_FEATURE_F16C))  has |= AVXEMU_F_F16C;
++	if (boot_cpu_has(X86_FEATURE_MOVBE)) has |= AVXEMU_F_MOVBE;
++	if (boot_cpu_has(X86_FEATURE_GFNI))  has |= AVXEMU_F_GFNI;
++	if (boot_cpu_has(X86_FEATURE_AVX_VNNI)) has |= AVXEMU_F_AVXVNNI;
++	if (boot_cpu_has(X86_FEATURE_SHA_NI)) has |= AVXEMU_F_SHA;
++	avxemu_host_has = has;
++
++	if (!avxemu_param) {
++		pr_info("disabled by command line\n");
++		return 0;
++	}
++	if (has == AVXEMU_F_ALL)
++		return 0;			/* nothing to emulate: zero overhead */
++	if (!boot_cpu_has(X86_FEATURE_AVX) || !boot_cpu_has(X86_FEATURE_XSAVE)) {
++		pr_info("CPU has no AVX/XSAVE state to build on; not enabled\n");
++		return 0;
++	}
++	static_branch_enable(&avxemu_active);
++	pr_info("emulating missing extensions in #UD (cpu has: avx2=%d fma=%d bmi1=%d bmi2=%d f16c=%d movbe=%d gfni=%d avx_vnni=%d sha_ni=%d)\n",
++		!!(has & AVXEMU_F_AVX2), !!(has & AVXEMU_F_FMA), !!(has & AVXEMU_F_BMI1),
++		!!(has & AVXEMU_F_BMI2), !!(has & AVXEMU_F_F16C), !!(has & AVXEMU_F_MOVBE),
++		!!(has & AVXEMU_F_GFNI), !!(has & AVXEMU_F_AVXVNNI), !!(has & AVXEMU_F_SHA));
++	return 0;
++}
++arch_initcall(avxemu_init);
++
++static int __init avxemu_debugfs(void)
++{
++	if (!static_key_enabled(&avxemu_active.key))
++		return 0;
++	debugfs_create_atomic_t("avxemu_emulated", 0444, arch_debugfs_dir, &n_emulated);
++	debugfs_create_atomic_t("avxemu_declined", 0444, arch_debugfs_dir, &n_declined);
++	debugfs_create_atomic_t("avxemu_faulted", 0444, arch_debugfs_dir, &n_fault);
++	return 0;
++}
++late_initcall(avxemu_debugfs);
+diff -urN a/arch/x86/kernel/fpu/avxemu/avxemu_types.h b/arch/x86/kernel/fpu/avxemu/avxemu_types.h
+--- a/arch/x86/kernel/fpu/avxemu/avxemu_types.h	1970-01-01 00:00:00.000000000 +0000
++++ b/arch/x86/kernel/fpu/avxemu/avxemu_types.h	2026-11-01 20:47:32.429641228 +0000
+@@ -0,0 +1,15 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/* Freestanding type shim: the same core builds in userland and in the kernel. */
++#ifndef _AVXEMU_TYPES_H
++#define _AVXEMU_TYPES_H
++#ifdef __KERNEL__
++#include <linux/types.h>
++#include <linux/string.h>
++#else
++#include <stdint.h>
++#include <string.h>
++typedef uint8_t u8;  typedef uint16_t u16; typedef uint32_t u32; typedef uint64_t u64;
++typedef int8_t  s8;  typedef int16_t  s16; typedef int32_t  s32; typedef int64_t  s64;
++#endif
++typedef unsigned __int128 avx_u128;
++#endif
+diff -urN a/arch/x86/kernel/traps.c b/arch/x86/kernel/traps.c
+--- a/arch/x86/kernel/traps.c	2026-11-01 15:56:06.139242145 +0000
++++ b/arch/x86/kernel/traps.c	2026-11-01 15:56:06.140452396 +0000
+@@ -301,6 +301,9 @@
+ static inline void handle_invalid_op(struct pt_regs *regs)
+ #endif
+ {
++	if (user_mode(regs) && avxemu_handle_ud(regs))
++		return;
++
+ 	do_error_trap(regs, 0, "invalid opcode", X86_TRAP_UD, SIGILL,
+ 		      ILL_ILLOPN, error_get_trap_addr(regs));
+ }
