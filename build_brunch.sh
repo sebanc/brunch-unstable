@@ -26,7 +26,7 @@ if [ -f ../chromiumos-stage3/chromiumos_stage3.tar.gz ]; then
 	echo "Using local ChromiumOS Stage3"
 	cp ../chromiumos-stage3/chromiumos_stage3.tar.gz ./out/chromiumos_stage3.tar.gz || { echo "Failed to copy the brunch toolchain"; exit 1; }
 else
-	curl -L https://github.com/sebanc/chromiumos-stage3/releases/download/r154-20261009/chromiumos_stage3_r154_20261009.tar.gz -o ./out/chromiumos_stage3.tar.gz || { echo "Failed to download the brunch toolchain"; exit 1; }
+	curl -L https://github.com/sebanc/chromiumos-stage3/releases/download/r158-20261122/chromiumos_stage3_r158_20261122.tar.gz -o ./out/chromiumos_stage3.tar.gz || { echo "Failed to download the brunch toolchain"; exit 1; }
 fi
 tar zxf ./out/chromiumos_stage3.tar.gz -C ./chroot || { echo "Failed to extract the brunch toolchain"; exit 1; }
 rm -f ./out/chromiumos_stage3.tar.gz
@@ -43,7 +43,7 @@ if [ ! -z $1 ] && [ "$1" != "skip" ] ; then
 else
 	git clone --depth=1 -b master https://github.com/sebanc/chromeos-ota-extract.git rootfs || { echo "Failed to clone chromeos-ota-extract"; exit 1; }
 	cd rootfs
-	curl -L https://dl.google.com/chromeos/reven/16836.33.0/stable-channel/chromeos_16836.33.0_reven_stable-channel_full_RevenMPKeys-v11.bin-gzqwmnjymjswkymuxbiw6yb536rwbrdx.signed -o ./update.signed || { echo "Failed to Download the OTA update"; exit 1; }
+	curl -L https://dl.google.com/chromeos/reven/16868.24.0/stable-channel/chromeos_16868.24.0_reven_stable-channel_full_RevenMPKeys-v11.bin-gzqwmytgmvrdomkjj2umr6gsaqjysffe.signed -o ./update.signed || { echo "Failed to Download the OTA update"; exit 1; }
 	PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python python3 extract_android_ota_payload.py ./update.signed || { echo "Failed to extract the OTA update"; exit 1; }
 	cd ..
 	[ -f ./rootfs/root.img ] || { echo "ChromeOS rootfs has not been extracted"; exit 1; }
@@ -75,7 +75,7 @@ chmod 0755 ./chroot/home/chronos/initramfs/init || { echo "Failed to change init
 chown -R 1000:1000 ./chroot/home/chronos/initramfs || { echo "Failed to fix initramfs directory ownership"; exit 1; }
 
 mkdir ./chroot/home/chronos/rootc || { echo "Failed to create rootc directory"; exit 1; }
-ln -s kernel-6.12 ./chroot/home/chronos/rootc/kernel || { echo "Failed to make the default kernel symlink"; exit 1; }
+ln -s kernel-6.18 ./chroot/home/chronos/rootc/kernel || { echo "Failed to make the default kernel symlink"; exit 1; }
 ln -s kernel ./chroot/home/chronos/rootc/kernel-4.19 || { echo "Failed to make the legacy kernel symlink"; exit 1; }
 ln -s kernel ./chroot/home/chronos/rootc/kernel-5.4 || { echo "Failed to make the legacy kernel symlink"; exit 1; }
 ln -s kernel ./chroot/home/chronos/rootc/kernel-5.10 || { echo "Failed to make the legacy kernel symlink"; exit 1; }
